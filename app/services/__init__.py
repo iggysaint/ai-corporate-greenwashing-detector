@@ -5,6 +5,7 @@ from app.services.document_service import DocumentService, get_document_service
 from app.services.evidence_service import EvidenceService, get_evidence_service
 from app.services.gse_service import GSEService, get_gse_service
 from app.services.llm_service import LLMService, get_llm_service
+from app.services.scoring_service import ScoringService, get_scoring_service
 from app.services.sec_service import SECService, get_sec_service, normalize_and_validate_ticker
 
 __all__ = [
@@ -20,5 +21,7 @@ __all__ = [
     "get_llm_service",
     "GSEService",
     "get_gse_service",
+    "ScoringService",
+    "get_scoring_service",
     "normalize_and_validate_ticker",
 ]

@@ -8,6 +8,7 @@ from app.api.company_routes import router as company_router
 from app.api.evaluation_routes import router as evaluation_router
 from app.api.evidence_routes import router as evidence_router
 from app.api.gse_routes import router as gse_router
+from app.api.scoring_routes import router as scoring_router
 from app.utils.config import settings
 from app.services.gse_service import (
     GSECompanyNotFoundError,
@@ -38,7 +39,7 @@ from app.utils.exceptions import (
 app = FastAPI(
     title=settings.APP_NAME,
     description="Analytical platform for evaluating corporate sustainability claims against SEC filings, Ghana Stock Exchange disclosures, and public corporate reports.",
-    version="0.7.0",
+    version="0.8.0",
 )
 
 
@@ -217,6 +218,7 @@ def gse_service_handler(request: Request, exc: GSEServiceError) -> JSONResponse:
 app.include_router(company_router, prefix="/api/v1")
 app.include_router(evidence_router, prefix="/api/v1")
 app.include_router(evaluation_router, prefix="/api/v1")
+app.include_router(scoring_router, prefix="/api/v1")
 app.include_router(gse_router, prefix="/api/v1")
 
 

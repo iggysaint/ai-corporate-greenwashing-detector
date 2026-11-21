@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.0
     EVALUATION_CACHE_IN_MEMORY: bool = True
 
+    # Scoring Engine Configuration
+    SCORE_WEIGHT_ENVIRONMENTAL: float = 0.40
+    SCORE_WEIGHT_SOCIAL: float = 0.35
+    SCORE_WEIGHT_GOVERNANCE: float = 0.25
+    SCORING_METHODOLOGY_VERSION: str = "1.0.0"
+
     # Future Database Integration
     DATABASE_URL: Optional[str] = None
 

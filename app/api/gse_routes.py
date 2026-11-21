@@ -9,7 +9,7 @@ Provides endpoints for:
 """
 
 from typing import List, Optional
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from app.models.market import (
     DocumentSourceType,
@@ -18,8 +18,14 @@ from app.models.market import (
     GSECompanyListResponse,
     GSEDocumentResponse,
     MarketDocument,
+    MarketIdentifier,
+)
+from app.models.scoring import (
+    ESGIntegrityScoreResponse,
+    ESGScoreBreakdownResponse,
 )
 from app.services.gse_service import GSEService, get_gse_service
+from app.services.scoring_service import ScoringService, get_scoring_service
 
 router = APIRouter(prefix="/gse", tags=["Ghana Stock Exchange"])
 
@@ -118,3 +124,57 @@ def get_ghana_esg_keywords(
 ) -> List[str]:
     """Return Ghana-specific ESG keywords, optionally filtered by sector."""
     return GSEService.get_ghana_esg_keywords(sector=sector)
+
+
+# ── GSE ESG Integrity Scoring Endpoints ─────────────────
+
+@router.get(
+    "/companies/{ticker}/score",
+    response_model=ESGIntegrityScoreResponse,
+    summary="Get GSE Company ESG Integrity Score",
+    description=(
+        "Retrieve the ESG Integrity Score (0-100) evaluating the credibility and evidence "
+        "substantiation of sustainability claims in a Ghana Stock Exchange company's disclosures."
+    ),
+)
+def get_gse_company_score(
+    ticker: str,
+    source_url: Optional[str] = Query(None, description="Optional direct URL to corporate document"),
+    reporting_period: Optional[str] = Query(None, description="Reporting period (e.g. '2024')"),
+    scoring_service: ScoringService = Depends(get_scoring_service),
+) -> ESGIntegrityScoreResponse:
+    """Retrieve the primary ESG Integrity Score response for a GSE company."""
+    if source_url or reporting_period:
+        breakdown = scoring_service.calculate_gse_score(
+            ticker=ticker,
+            source_url=source_url,
+            reporting_period=reporting_period,
+        )
+        return ESGIntegrityScoreResponse(**breakdown.model_dump(exclude={"dimensions", "claim_scores", "materiality_summary", "methodology_details"}))
+    return scoring_service.get_company_score(ticker=ticker, market=MarketIdentifier.GH_GSE)
+
+
+@router.get(
+    "/companies/{ticker}/score/breakdown",
+    response_model=ESGScoreBreakdownResponse,
+    summary="Get Detailed GSE Company ESG Integrity Score Breakdown",
+    description=(
+        "Retrieve the full transparent calculation breakdown of the ESG Integrity Score for a GSE company, "
+        "including pillar scores, claim-level materiality weights, and Ghana-specific sector priority enrichments."
+    ),
+)
+def get_gse_company_score_breakdown(
+    ticker: str,
+    source_url: Optional[str] = Query(None, description="Optional direct URL to corporate document"),
+    reporting_period: Optional[str] = Query(None, description="Reporting period (e.g. '2024')"),
+    scoring_service: ScoringService = Depends(get_scoring_service),
+) -> ESGScoreBreakdownResponse:
+    """Retrieve the detailed ESG Integrity Score breakdown for a GSE company."""
+    if source_url or reporting_period:
+        return scoring_service.calculate_gse_score(
+            ticker=ticker,
+            source_url=source_url,
+            reporting_period=reporting_period,
+        )
+    return scoring_service.get_company_score_breakdown(ticker=ticker, market=MarketIdentifier.GH_GSE)
+

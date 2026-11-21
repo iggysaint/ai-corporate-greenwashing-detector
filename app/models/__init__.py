@@ -49,6 +49,15 @@ from app.models.market import (
     MarketDocument,
     MarketIdentifier,
 )
+from app.models.scoring import (
+    ClaimScoreDetail,
+    ConfidenceLevel,
+    DimensionalScore,
+    ESGIntegrityScoreResponse,
+    ESGScoreBreakdownResponse,
+    ESGScoreHistoryResponse,
+    ScoreStatus,
+)
 
 __all__ = [
     "Company",
@@ -92,4 +101,11 @@ __all__ = [
     "GSEDocumentResponse",
     "GSEAnalysisResponse",
     "MarketDocument",
+    "ScoreStatus",
+    "ConfidenceLevel",
+    "DimensionalScore",
+    "ClaimScoreDetail",
+    "ESGIntegrityScoreResponse",
+    "ESGScoreBreakdownResponse",
+    "ESGScoreHistoryResponse",
 ]
