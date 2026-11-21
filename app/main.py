@@ -2,6 +2,7 @@
 
 from typing import Dict
 from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.company_routes import router as company_router
@@ -15,7 +16,9 @@ from app.services.gse_service import (
     GSEConnectionError,
     GSEDocumentParsingError,
     GSEDocumentRetrievalError,
+    GSEDocumentSourceRequiredError,
     GSEServiceError,
+    GSETickerValidationError,
 )
 from app.utils.exceptions import (
     ClaimNotFoundError,
@@ -40,6 +43,14 @@ app = FastAPI(
     title=settings.APP_NAME,
     description="Analytical platform for evaluating corporate sustainability claims against SEC filings, Ghana Stock Exchange disclosures, and public corporate reports.",
     version="0.8.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -173,6 +184,22 @@ def security_validation_handler(request: Request, exc: SecurityValidationError) 
 
 
 # ── GSE Exception Handlers ──────────────────────────────
+
+@app.exception_handler(GSETickerValidationError)
+def gse_ticker_validation_handler(request: Request, exc: GSETickerValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": str(exc), "error": "invalid_gse_ticker"},
+    )
+
+
+@app.exception_handler(GSEDocumentSourceRequiredError)
+def gse_document_source_required_handler(request: Request, exc: GSEDocumentSourceRequiredError) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": str(exc), "error": "gse_document_source_required"},
+    )
+
 
 @app.exception_handler(GSECompanyNotFoundError)
 def gse_company_not_found_handler(request: Request, exc: GSECompanyNotFoundError) -> JSONResponse:

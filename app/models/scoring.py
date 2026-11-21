@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.evaluation import AssessmentCategory
+from app.models.evaluation import AssessmentCategory, EvidenceReference
 from app.models.market import MarketIdentifier
 
 
@@ -120,6 +120,10 @@ class ClaimScoreDetail(BaseModel):
     referenced_evidence_ids: List[str] = Field(
         default_factory=list,
         description="Evidence IDs cited in this claim's assessment",
+    )
+    referenced_evidence: List[EvidenceReference] = Field(
+        default_factory=list,
+        description="Structured evidence citations (ID, section, relevance, relationship, and verbatim quote) supporting this assessment",
     )
     caveats_count: int = Field(0, description="Number of caveats noted in evaluation")
     reasoning: str = Field(..., description="Analytical evaluation rationale")

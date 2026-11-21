@@ -413,6 +413,7 @@ class ScoringService:
             is_quantified=is_quantified,
             sector_priority_match=sector_match,
             referenced_evidence_ids=[r.evidence_id for r in ev.referenced_evidence],
+            referenced_evidence=list(ev.referenced_evidence),
             caveats_count=len(ev.caveats),
             reasoning=ev.reasoning,
         )

@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     # Confidence is capped at MEDIUM when every evaluation is rule-based (keyword heuristics, not reading comprehension)
     SCORE_CAP_CONFIDENCE_FOR_RULE_BASED: bool = True
 
+    # CORS Configuration (for local and deployed frontend clients)
+    CORS_ALLOW_ORIGINS: list[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
     # Future Database Integration
     DATABASE_URL: Optional[str] = None
 

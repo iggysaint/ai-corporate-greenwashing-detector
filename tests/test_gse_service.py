@@ -985,3 +985,41 @@ def test_gse_analyze_endpoint_blocked_extension():
     )
     assert response.status_code == 400
     assert "not permitted" in response.json()["detail"].lower()
+
+
+def test_gse_invalid_ticker_returns_400():
+    """Invalid GSE ticker symbols return 400 invalid_gse_ticker across detail and scoring endpoints."""
+    for method, path in (
+        ("GET", "/api/v1/gse/companies/MTN-GH!"),
+        ("GET", "/api/v1/gse/companies/MTN-GH!/score"),
+        ("GET", "/api/v1/gse/companies/MTN-GH!/score/breakdown"),
+        ("GET", "/api/v1/gse/companies/MTN-GH!/score/history"),
+        ("POST", "/api/v1/gse/companies/MTN-GH!/analyze"),
+    ):
+        response = client.request(method, path)
+        assert response.status_code == 400, f"Expected 400 for {method} {path}, got {response.status_code}"
+        body = response.json()
+        assert body["error"] == "invalid_gse_ticker"
+        assert "Invalid GSE ticker format" in body["detail"]
+
+
+def test_gse_missing_source_url_for_uncurated_issuer_returns_422():
+    """Requesting analysis or score for an uncurated GSE issuer without source_url returns 422."""
+    from app.services.scoring_service import ScoringService, get_scoring_service
+
+    gse_svc = _mock_gse_service_with_list(MOCK_GSE_EQUITIES_LIST)
+    gse_svc.get_listed_companies()
+    scoring_svc = ScoringService(gse_service=gse_svc)
+
+    app.dependency_overrides[get_scoring_service] = lambda: scoring_svc
+    try:
+        with patch("app.api.gse_routes.get_gse_service", return_value=gse_svc):
+            analyze_resp = client.post("/api/v1/gse/companies/GCB/analyze")
+            assert analyze_resp.status_code == 422
+            assert analyze_resp.json()["error"] == "gse_document_source_required"
+
+            score_resp = client.get("/api/v1/gse/companies/GCB/score")
+            assert score_resp.status_code == 422
+            assert score_resp.json()["error"] == "gse_document_source_required"
+    finally:
+        app.dependency_overrides.pop(get_scoring_service, None)

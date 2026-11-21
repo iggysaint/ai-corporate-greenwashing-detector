@@ -442,8 +442,29 @@ def test_evidence_traceability():
     d = next(c for c in r.claim_scores if c.claim_id == "claim_abc")
     assert d.evaluation_id == "eval_claim_abc"
     assert d.referenced_evidence_ids == ["ev_123", "ev_456"]
+    assert len(d.referenced_evidence) == 2
+    assert d.referenced_evidence[0].evidence_id == "ev_123"
+    assert d.referenced_evidence[0].quote == "Verbatim evidence excerpt."
     assert "0000000000-26-000001" in r.source_document_references[0]
     assert any("[claim_abc]" in p for p in r.main_positive_factors)
+
+
+def test_claim_score_detail_includes_structured_referenced_evidence_in_api(api_service):
+    """Both US SEC and GSE /score/breakdown endpoints expose structured evidence quotes alongside IDs."""
+    for url, expected_id in (
+        ("/api/v1/companies/AAPL/score/breakdown", "ev_s0"),
+        ("/api/v1/gse/companies/MTNGH/score/breakdown", "ev_s0"),
+    ):
+        data = client.get(url).json()
+        first = data["claim_scores"][0]
+        assert first["referenced_evidence_ids"] == [expected_id]
+        assert len(first["referenced_evidence"]) == 1
+        ev_ref = first["referenced_evidence"][0]
+        assert ev_ref["evidence_id"] == expected_id
+        assert ev_ref["section_id"] == "item_1"
+        assert ev_ref["relationship"] == "supporting"
+        assert ev_ref["relevance_score"] == 0.45
+        assert ev_ref["quote"] == "Verbatim evidence excerpt."
 
 
 def test_duplicate_claim_evaluations_counted_once():

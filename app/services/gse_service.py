@@ -109,6 +109,10 @@ class GSEServiceError(Exception):
     """Base exception for GSE service operations."""
 
 
+class GSETickerValidationError(GSEServiceError):
+    """Raised when a GSE ticker symbol is empty or fails format validation."""
+
+
 class GSEConnectionError(GSEServiceError):
     """Raised when the GSE API is unreachable."""
 
@@ -119,6 +123,10 @@ class GSECompanyNotFoundError(GSEServiceError):
 
 class GSEDocumentRetrievalError(GSEServiceError):
     """Raised when a document cannot be retrieved for a GSE company."""
+
+
+class GSEDocumentSourceRequiredError(GSEDocumentRetrievalError):
+    """Raised when no document URL is provided and no curated public report exists for the GSE company."""
 
 
 class GSEDocumentParsingError(GSEServiceError):
@@ -137,9 +145,11 @@ def normalize_gse_ticker(ticker: str) -> str:
     """
     clean = ticker.strip().upper()
     if not clean:
-        raise GSEServiceError("GSE ticker symbol cannot be empty")
+        raise GSETickerValidationError("GSE ticker symbol cannot be empty")
     if not re.match(r"^[A-Z0-9]{1,10}$", clean):
-        raise GSEServiceError(f"Invalid GSE ticker format: '{ticker}'. Expected 1-10 uppercase alphanumeric characters.")
+        raise GSETickerValidationError(
+            f"Invalid GSE ticker format: '{ticker}'. Expected 1-10 uppercase alphanumeric characters."
+        )
     return clean
 
 
@@ -647,7 +657,7 @@ class GSEService:
                 source_type = available_with_url[0].source_type
                 reporting_period = available_with_url[0].reporting_period
             else:
-                raise GSEDocumentRetrievalError(
+                raise GSEDocumentSourceRequiredError(
                     f"No document URL specified and no verified public report available for {company.ticker}."
                 )
 
