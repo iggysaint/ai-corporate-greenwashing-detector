@@ -586,6 +586,15 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 - API Docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 - Alternative Redoc: [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc)
 
+### 5. Run the Frontend (ESG Integrity Intelligence)
+```bash
+cd frontend
+npm install
+npm run dev
+```
+- Web app: [http://localhost:3000](http://localhost:3000) (calls the API at `NEXT_PUBLIC_API_BASE_URL`, default `http://127.0.0.1:8000`)
+- See [`frontend/README.md`](frontend/README.md) for configuration, screens, and quality checks.
+
 ---
 
 ## 9. Testing & Verification
