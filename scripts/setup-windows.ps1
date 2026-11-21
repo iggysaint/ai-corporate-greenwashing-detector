@@ -11,6 +11,14 @@ $RepoUrl = "https://github.com/iggysaint/ai-corporate-greenwashing-detector.git"
 
 function Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Have($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
+function Invoke-Checked($desc, [scriptblock]$cmd, $attempts = 3) {
+    for ($i = 1; $i -le $attempts; $i++) {
+        & $cmd
+        if ($LASTEXITCODE -eq 0) { return }
+        if ($i -lt $attempts) { Write-Host "$desc failed (attempt $i of $attempts) - retrying in 10 s..." -ForegroundColor Yellow; Start-Sleep -Seconds 10 }
+    }
+    throw "$desc failed after $attempts attempts (often a network drop). Check your connection and re-run this script."
+}
 function Refresh-Path {
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [Environment]::GetEnvironmentVariable("Path", "User")
@@ -55,14 +63,13 @@ if (-not (Test-Path ".\frontend\package.json")) { throw "frontend/ not found - m
 # 3. Backend
 Step "Setting up the backend (Python virtual environment)"
 if (-not (Test-Path ".\.venv")) { python -m venv .venv }
-& .\.venv\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Invoke-Checked "pip install" { & .\.venv\Scripts\python.exe -m pip install --retries 10 --timeout 60 -r requirements.txt }
 if (-not (Test-Path ".\.env")) { Copy-Item .env.example .env; Write-Host "Created .env from .env.example" }
 
 # 4. Frontend
 Step "Setting up the frontend (npm install)"
 Push-Location .\frontend
-npm install
+Invoke-Checked "npm install" { npm install --fetch-retries=5 --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000 }
 if (-not (Test-Path ".\.env.local")) { Copy-Item .env.example .env.local; Write-Host "Created frontend\.env.local" }
 Pop-Location
 
