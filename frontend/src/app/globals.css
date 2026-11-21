@@ -1,0 +1,114 @@
+@import "tailwindcss";
+
+/*
+ * ESG Integrity Intelligence — design tokens.
+ * Restrained palette: deep ink navigation, soft neutral canvas, forest accent.
+ * Assessment colours are always paired with a text label and an icon, never used alone.
+ */
+@theme inline {
+  --font-sans: var(--font-plex-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-source-serif), ui-serif, Georgia, serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, monospace;
+}
+
+@theme {
+  /* Navigation / ink */
+  --color-ink-950: #08131f;
+  --color-ink-900: #0c1b2a;
+  --color-ink-800: #132638;
+  --color-ink-700: #1d3349;
+  --color-ink-600: #2c4560;
+  --color-ink-300: #93a4b6;
+  --color-ink-200: #c4cfda;
+
+  /* Canvas & text */
+  --color-canvas: #f5f6f3;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f9faf8;
+  --color-line: #e2e5df;
+  --color-line-strong: #cdd2ca;
+  --color-text: #13202b;
+  --color-text-muted: #56636e;
+  --color-text-subtle: #6f7a84;
+
+  /* Accent: forest / emerald */
+  --color-forest-50: #eef6f1;
+  --color-forest-100: #d7eadf;
+  --color-forest-200: #b0d4bf;
+  --color-forest-500: #2f7d5b;
+  --color-forest-600: #236a4b;
+  --color-forest-700: #1b553c;
+  --color-forest-800: #15422f;
+
+  /* Assessment semantics */
+  --color-supported: #1f6b4a;
+  --color-supported-bg: #e6f2eb;
+  --color-partial: #4f7f22;
+  --color-partial-bg: #eef4e2;
+  --color-unsub: #995800;
+  --color-unsub-bg: #fdf1dc;
+  --color-inconsistent: #b3261e;
+  --color-inconsistent-bg: #fbe9e7;
+  --color-insufficient: #5f6a74;
+  --color-insufficient-bg: #eceef0;
+
+  --color-warn: #8f5400;
+  --color-warn-bg: #fff5e3;
+  --color-danger: #b3261e;
+  --color-danger-bg: #fdecea;
+  --color-info: #1f4e79;
+  --color-info-bg: #eaf1f8;
+
+  --shadow-card: 0 1px 2px rgb(16 24 32 / 0.04), 0 1px 1px rgb(16 24 32 / 0.03);
+  --shadow-pop: 0 12px 32px -8px rgb(8 19 31 / 0.25), 0 2px 6px rgb(8 19 31 / 0.08);
+
+  --animate-progress: progress-slide 1.6s ease-in-out infinite;
+  @keyframes progress-slide {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(250%);
+    }
+  }
+}
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  background: var(--color-canvas);
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular figures for all data displays */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hatched fill marks "missing / not assessed" so it never reads as a low score */
+.hatch {
+  background-image: repeating-linear-gradient(135deg, rgb(95 106 116 / 0.22) 0 4px, transparent 4px 8px);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-forest-500);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
