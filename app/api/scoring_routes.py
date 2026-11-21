@@ -60,8 +60,9 @@ def get_company_score_breakdown(
     response_model=ESGScoreHistoryResponse,
     summary="Get Company ESG Integrity Score History",
     description=(
-        "Retrieve historical integrity scores evaluated for this company during the active session. "
-        "Scores are maintained in memory; persistent database storage is not enabled in this phase."
+        "Return only ESG Integrity assessments actually computed by this server process for the company "
+        "(in-memory; no database in this phase; cleared on restart). Historical scores are never estimated "
+        "or fabricated. Returns zero records if no assessment has been run yet."
     ),
 )
 def get_company_score_history(

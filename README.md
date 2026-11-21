@@ -52,17 +52,40 @@ Sustainability Claims Identification                       [PHASE 4 - IMPLEMENTE
 Evidence & Cross-Reference Engine                           [PHASE 5 - IMPLEMENTED]
   │
   ▼
-LLM Analysis & Verification Reasoning                      [PHASE 6 - FUTURE]
+LLM Analysis & Verification Reasoning                      [PHASE 6 - IMPLEMENTED]
   │
   ▼
-ESG Integrity Score & Dashboard                            [PHASE 6 - FUTURE]
+Ghana Stock Exchange (GSE) Integration & Hardening         [PHASE 7/7A - IMPLEMENTED]
+  │
+  ▼
+ESG Integrity Scoring Engine                               [PHASE 8 - IMPLEMENTED]
+  │
+  ▼
+Dashboard, Persistence & External Monitoring               [PHASE 9+ - FUTURE]
 ```
 
 ---
 
 ## 3. Current Development Phase
 
-> **Current Phase: PHASE 5 — EVIDENCE & CROSS-REFERENCE ENGINE**
+> **Current Phase: PHASE 8 — ESG INTEGRITY SCORING ENGINE**
+
+### Implemented in Phase 8: ESG Integrity Scoring Engine
+
+- **Full Methodology Documentation**: See [ESG Integrity Score Methodology](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%20greenwashing-detector/docs/ESG_INTEGRITY_SCORE_METHODOLOGY.md) for the analyst-friendly formula specification, weights, worked examples, and limitations.
+- **Deterministic Scoring Service** ([`app/services/scoring_service.py`](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%20greenwashing-detector/app/services/scoring_service.py)): Pure, repeatable calculation mapping claim evaluations (`supported`, `partially_supported`, `unsubstantiated`, `inconsistent`, `insufficient_evidence`) into a `0–100` **ESG Integrity Score**.
+- **Non-Overlapping Bands & Materiality**: Applies non-overlapping assessment bands, bounded additive evidence quality adjustments, claim-type/quantification/sector-priority materiality weights, and low-materiality volume damping (`25%` cap).
+- **E / S / G Dimensional Breakdown**: Separate Environmental (`0.40`), Social (`0.35`), and Governance (`0.25`) scores with thin-pillar sufficiency scaling and explicit `insufficient_data` (`null`) reporting for unscored dimensions.
+- **Separate Reliability Metrics**: Reports `evidence_coverage`, `substantiation_rate`, and capped `confidence` levels (`high`, `medium`, `low`, `insufficient`), plus minimum assessable claim threshold (`>= 3`).
+- **Multi-Market Integration**: Applies identical standards to both US SEC (`MarketIdentifier.US_SEC`) and Ghana Stock Exchange (`MarketIdentifier.GH_GSE`) companies via 6 dedicated scoring endpoints ([`app/api/scoring_routes.py`](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%20greenwashing-detector/app/api/scoring_routes.py) and [`app/api/gse_routes.py`](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%20greenwashing-detector/app/api/gse_routes.py)).
+
+> [!IMPORTANT]
+> The **ESG Integrity Score** measures **only** the substantiation and credibility of disclosed sustainability claims based on retrieved filing evidence. It does **not** measure total environmental or social impact, is **not** a comprehensive ESG performance rating or audit, and does **not** prove or disprove greenwashing.
+
+### Previously Implemented (Phases 6 & 7/7A)
+
+- **Phase 6 — LLM-Assisted Evaluation & Consistency Engine** ([`app/services/llm_service.py`](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%20greenwashing-detector/app/services/llm_service.py)): Structured OpenAI evaluation with strict evidence-ID citation validation, non-ESG boilerplate filtering, and deterministic rule-based fallback when `OPENAI_API_KEY` is unconfigured.
+- **Phases 7 & 7A — Ghana Stock Exchange (GSE) Integration** ([`app/services/gse_service.py`](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%20greenwashing-detector/app/services/gse_service.py), [`app/utils/security.py`](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%20greenwashing-detector/app/utils/security.py)): Live Kwayisi GSE company discovery, verified report ingestion and PDF/HTML extraction (`PyPDF2` + `BeautifulSoup4`), Ghana sector ESG taxonomy (`mining`, `agriculture`, `oil_and_gas`, `banking`, `telecommunications`, `manufacturing`), and SSRF/redirect/extension download security hardening.
 
 ### Implemented in Phase 5: Evidence & Cross-Reference Engine
 
@@ -152,12 +175,10 @@ Each extracted [`Claim`](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%2
 - **Traceable ESG Passage Extraction**: Deterministic keyword scanner preserving section, offset, and URL provenance.
 - **In-Memory Caching**: Parsed documents cached by accession number.
 
-### Deferred to Later Phases
-- LLM-assisted claim interpretation and evidence cross-examination
-- External sustainability report / CSR website scraping
-- AI-generated objective assessments (Supported / Partially Supported / Inconsistent / Unsubstantiated)
-- Deterministic ESG Integrity scoring algorithms
-- Database persistence and web frontend UI
+### Deferred to Later Phases (Phase 9+)
+- Database persistence & longitudinal historical storage
+- Web frontend dashboard UI & user authentication
+- External news monitoring & satellite verification modules
 
 ---
 
@@ -204,7 +225,10 @@ ai-corporate-greenwashing-detector/
 │   ├── api/
 │   │   ├── __init__.py          # API route exports
 │   │   ├── company_routes.py    # Company, filing, document & claim endpoints
-│   │   └── evidence_routes.py   # Evidence & cross-reference endpoints (Phase 5)
+│   │   ├── evidence_routes.py   # Evidence & cross-reference endpoints (Phase 5)
+│   │   ├── evaluation_routes.py # Claim consistency evaluation endpoints (Phase 6)
+│   │   ├── gse_routes.py        # Ghana Stock Exchange endpoints (Phase 7/7A/8)
+│   │   └── scoring_routes.py    # ESG Integrity Score endpoints (Phase 8)
 │   │
 │   ├── services/
 │   │   ├── __init__.py          # Service exports
@@ -212,8 +236,9 @@ ai-corporate-greenwashing-detector/
 │   │   ├── document_service.py  # 10-K document ingestion, parsing & passages
 │   │   ├── claims_service.py    # Claim extraction (Phase 4)
 │   │   ├── evidence_service.py  # Evidence & cross-reference engine (Phase 5)
-│   │   ├── llm_service.py       # LLM evaluation interface (Phase 6+)
-│   │   └── scoring_service.py   # ESG Integrity scoring (Phase 6+)
+│   │   ├── llm_service.py       # LLM evaluation & rule-based fallback (Phase 6)
+│   │   ├── gse_service.py       # GSE discovery, PDF/HTML ingestion & analysis (Phase 7/7A)
+│   │   └── scoring_service.py   # ESG Integrity scoring engine (Phase 8)
 │   │
 │   ├── models/
 │   │   ├── __init__.py          # Domain model exports
@@ -221,31 +246,43 @@ ai-corporate-greenwashing-detector/
 │   │   ├── filing.py            # SECFiling models
 │   │   ├── document.py          # Document, DocumentSection, RelevantPassage models
 │   │   ├── claim.py             # Claim, ClaimType, ClaimCategoryGroup, SourceReference models
-│   │   └── evidence.py          # Evidence, ClaimEvidenceResult, EvidenceSummary models (Phase 5)
+│   │   ├── evidence.py          # Evidence, ClaimEvidenceResult, EvidenceSummary models (Phase 5)
+│   │   ├── evaluation.py        # ClaimEvaluation, EvaluationSummary models (Phase 6)
+│   │   ├── market.py            # MarketIdentifier, GSECompany, MarketDocument models (Phase 7)
+│   │   └── scoring.py           # ESGIntegrityScoreResponse, Breakdown & History models (Phase 8)
 │   │
 │   └── utils/
 │       ├── __init__.py          # Utility exports
 │       ├── config.py            # Pydantic Settings application configuration
-│       └── exceptions.py        # Domain exceptions (includes ClaimNotFoundError, EvidenceNotFoundError)
+│       ├── exceptions.py        # Domain exceptions
+│       └── security.py          # SSRF, redirect, extension & download size safeguards (Phase 7A)
+│
+├── docs/
+│   └── ESG_INTEGRITY_SCORE_METHODOLOGY.md  # Full Phase 8 scoring formula & rationale
 │
 ├── frontend/
 │   └── README.md                # Frontend specifications & roadmap
 │
 ├── scripts/
-│   └── verify_live_sec.py       # Standalone live SEC verification CLI (Phases 1-5)
+│   ├── verify_live_sec.py       # Standalone live SEC verification CLI (Phases 1-6)
+│   └── verify_live_gse.py       # Standalone live GSE verification CLI (Phase 7A)
 │
 ├── tests/
 │   ├── __init__.py
 │   ├── test_health.py           # Health check test
-│   ├── test_sec_service.py      # SECService unit tests (mocked SEC responses)
+│   ├── test_sec_service.py      # SECService unit tests
 │   ├── test_api_company.py      # Company & filing endpoint tests
 │   ├── test_document_service.py # DocumentService parsing & extraction tests
 │   ├── test_api_document.py     # Document inspection API tests
 │   ├── test_sec_integration.py  # Live SEC integration tests (Apple Inc.)
-│   ├── test_claims_service.py   # ClaimsService unit tests (mocked documents)
+│   ├── test_claims_service.py   # ClaimsService unit tests
 │   ├── test_api_claims.py       # Claims API endpoint tests
 │   ├── test_evidence_service.py # EvidenceService unit tests (Phase 5)
-│   └── test_api_evidence.py     # Evidence API endpoint tests (Phase 5)
+│   ├── test_api_evidence.py     # Evidence API endpoint tests (Phase 5)
+│   ├── test_llm_service.py      # LLMService & fallback unit tests (Phase 6)
+│   ├── test_api_evaluation.py   # Evaluation API endpoint tests (Phase 6)
+│   ├── test_gse_service.py      # GSE & SSRF security tests (Phase 7/7A)
+│   └── test_scoring_service.py  # ESG Integrity Scoring & API tests (Phase 8)
 │
 ├── data/
 │   ├── raw/                     # Directory for unprocessed filings (git-ignored)
@@ -501,6 +538,26 @@ All endpoints return JSON responses.
   ```
 - **Response**: `200 OK` (returns `CompanyEvidenceResponse` with full per-claim results)
 
+### 14. Claim Consistency Evaluations (Phase 6)
+- `GET /api/v1/companies/{ticker}/evaluations` — Evaluate all extracted sustainability claims (`supported`, `partially_supported`, `inconsistent`, `unsubstantiated`, `insufficient_evidence`).
+- `GET /api/v1/companies/{ticker}/evaluations/summary` — Aggregate assessment counts and provider mode.
+- `GET /api/v1/companies/{ticker}/claims/{claim_id}/evaluation` — Evaluation detail for a single claim.
+
+### 15. Ghana Stock Exchange (GSE) Discovery & Analysis (Phase 7/7A)
+- `GET /api/v1/gse/companies` — List GSE-listed companies via the Kwayisi GSE API.
+- `GET /api/v1/gse/companies/{ticker}` — Retrieve GSE company details and curated/pending document links.
+- `POST /api/v1/gse/companies/{ticker}/documents` — Download and parse a corporate HTML/PDF report (with SSRF protection).
+- `POST /api/v1/gse/companies/{ticker}/analyze` — Run claim extraction, evidence retrieval, and consistency evaluation on a GSE report.
+- `GET /api/v1/gse/esg-keywords` — Retrieve Ghana ESG taxonomy keywords (optionally filtered by sector).
+
+### 16. ESG Integrity Scoring Engine (Phase 8)
+- `GET /api/v1/companies/{ticker}/score` — Primary ESG Integrity Score (`0–100` or `insufficient_data`), E/S/G scores, confidence, coverage, substantiation rate, positive factors, concerns, and scope disclaimer.
+- `GET /api/v1/companies/{ticker}/score/breakdown` — Full calculation trace including dimensional weights, per-claim materiality/quality adjustments, and cited evidence IDs.
+- `GET /api/v1/companies/{ticker}/score/history` — In-memory history of computed assessments for the current server session (no fabricated history).
+- `GET /api/v1/gse/companies/{ticker}/score` — Primary ESG Integrity Score for a GSE company (accepts optional `source_url` and `reporting_period`).
+- `GET /api/v1/gse/companies/{ticker}/score/breakdown` — Detailed calculation breakdown and Ghana sector materiality match for a GSE company.
+- `GET /api/v1/gse/companies/{ticker}/score/history` — In-memory history of computed GSE assessments.
+
 ---
 
 ## 8. Installation & Setup
@@ -540,21 +597,14 @@ All core service and API tests use mocked SEC responses to guarantee determinism
 pytest -v
 ```
 
-Expected: **88 tests passing** (Phases 1–5)
+Expected: **226 tests passing** (Phases 1–8)
 
-### Live SEC Integration Testing
-To verify end-to-end connectivity with the real SEC EDGAR infrastructure using Apple Inc. (`AAPL`):
-
-```bash
-pytest -m integration -v
-```
-
-### Standalone Manual Verification Script
-Run the included verification CLI against Apple or any public ticker to exercise the full Phases 1–5 pipeline end-to-end:
+### Live Verification Scripts
+Run the included verification CLIs to test live SEC EDGAR (`AAPL`) or Ghana Stock Exchange (`MTNGH`) discovery:
 
 ```bash
 python scripts/verify_live_sec.py AAPL
-python scripts/verify_live_sec.py MSFT
+python scripts/verify_live_gse.py MTNGH
 ```
 
 ---
@@ -563,8 +613,9 @@ python scripts/verify_live_sec.py MSFT
 
 - **Filing Size**: SEC 10-K filings can be 2 to 20+ megabytes of raw HTML. To prevent network and browser strain, API endpoints return metadata summaries, targeted sections, and bounded passage lists rather than enormous raw HTML strings.
 - **HTML Diversity**: Companies submit 10-K filings formatted using different HTML generators, CSS architectures, and inline XBRL (iXBRL). The section detection engine uses tolerant regex heuristics with Table-of-Contents disambiguation, but atypical non-standard headings will default to the full document section.
-- **In-Memory Storage**: Document, claim, and evidence caching is stored in memory. Downloaded filings are not persisted to a database or committed to Git.
-- **Deterministic Extraction Precision**: Phases 4 and 5 use deterministic regex and keyword algorithms without an LLM. Some nuanced passages may receive contextual or qualifying classifications rather than deeper semantic assessment.
-- **10-K Scope**: The system currently cross-references claims only against SEC 10-K / 10-K/A filings. Standalone sustainability reports, CSR websites, and proxy statements are not yet ingested.
-- **No Greenwashing Verdicts**: Phase 5 produces neutral, retrieval-based evidence relationships (`supporting`, `contradictory`, `qualifying`, `contextual`, `insufficient_evidence`). Full LLM reasoning, ESG scoring, and dashboard visualisations belong to Phase 6 and beyond.
+- **In-Memory Storage**: Document, claim, evidence, evaluation, and score history caches are stored in memory only and cleared on restart. Persistent database storage belongs to a later phase.
+- **Rule-Based Evaluation Fallback**: When `OPENAI_API_KEY` is not set, Phase 6 uses deterministic keyword and evidence-relationship rules rather than LLM reading comprehension. Phase 8 automatically caps confidence at `medium` when all evaluations are rule-based.
+- **Single-Filing / Document Scope**: Claims are evaluated against the retrieved SEC Form 10-K/10-K/A or ingested GSE report; external news, satellite telemetry, and third-party ESG databases are out of scope in Phase 8.
+- **Score Methodology Scope**: Version `1.0.0` of the ESG Integrity Score evaluates only claim substantiation within retrieved disclosures. It is not a full ESG performance rating, legal greenwashing finding, or audited index; see [`docs/ESG_INTEGRITY_SCORE_METHODOLOGY.md`](file:///c:/Users/CALDWELL%20N.%20ARTHUR/ai-corporate-%20greenwashing-detector/docs/ESG_INTEGRITY_SCORE_METHODOLOGY.md).
+
 

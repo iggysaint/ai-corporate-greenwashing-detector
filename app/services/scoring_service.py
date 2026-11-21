@@ -1,33 +1,36 @@
-"""ESG Integrity Scoring Service.
+"""ESG Integrity Scoring Service (Phase 8).
 
-Responsible for deterministic synthesis, calculation, and explanation of ESG Integrity Scores
-evaluating corporate sustainability disclosures against retrieved regulatory evidence.
+Deterministic, explainable synthesis of claim evaluations into an ESG Integrity Score.
+Full methodology and rationale: docs/ESG_INTEGRITY_SCORE_METHODOLOGY.md
 
-IMPORTANT DISCLAIMER:
-    The ESG Integrity Score evaluates ONLY the credibility and evidence substantiation
-    of a company's disclosed sustainability claims based on retrieved corporate filings
-    and disclosure documents.
-    It does NOT:
-    - Measure the company's entire environmental or social impact.
-    - Serve as a comprehensive ESG performance rating.
-    - Make legal determinations regarding greenwashing or fraud.
-    - Substitute for an independent ESG audit.
+IMPORTANT SCOPE:
+    The ESG Integrity Score measures ONLY how well a company's disclosed sustainability
+    claims are substantiated by the evidence retrieved from the analysed disclosure documents.
+    It is NOT an ESG performance rating, NOT a measure of total environmental or social
+    impact, NOT proof that a company is or is not greenwashing, and NOT a substitute for an
+    independent ESG audit.
+
+Design rules enforced here:
+    - No LLM decides any number. Scores are pure functions of evaluation inputs + configuration.
+    - INSUFFICIENT_EVIDENCE is excluded from the score and reported via evidence coverage.
+    - UNSUBSTANTIATED receives partial credit; it is never treated as proven false.
+    - Assessment categories map to non-overlapping score bands.
+    - Low-materiality statements are volume-damped so they cannot swamp material claims.
+    - No numerical score is produced below a minimum number of assessable claims.
 """
 
-from collections import defaultdict
 from datetime import datetime, timezone
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from app.models.claim import ClaimCategoryGroup, ClaimType
-from app.models.company import Company
+from app.models.claim import ClaimType
 from app.models.evaluation import (
     AssessmentCategory,
     ClaimEvaluation,
     CompanyEvaluationResponse,
     EvaluationConfidence,
-    EvaluationSummary,
+    EvaluationMode,
 )
 from app.models.market import (
     DocumentSourceType,
@@ -44,58 +47,132 @@ from app.models.scoring import (
     ESGScoreHistoryResponse,
     ScoreStatus,
 )
-from app.services.gse_service import GHANA_ESG_SECTORS, GSEService, get_gse_service
+from app.services.gse_service import GHANA_ESG_SECTORS, GSEService, get_gse_service, normalize_gse_ticker
 from app.services.llm_service import LLMService, get_llm_service
 from app.services.sec_service import normalize_and_validate_ticker
 from app.utils.config import Settings, get_settings
-from app.utils.exceptions import CompanyNotFoundError, InsufficientDataError
 
 logger = logging.getLogger(__name__)
 
-# Base integrity scores by evaluation assessment category
-BASE_ASSESSMENT_SCORES: Dict[AssessmentCategory, float] = {
-    AssessmentCategory.SUPPORTED: 100.0,
-    AssessmentCategory.PARTIALLY_SUPPORTED: 60.0,
-    AssessmentCategory.UNSUBSTANTIATED: 25.0,
-    AssessmentCategory.INCONSISTENT: 0.0,
-    # INSUFFICIENT_EVIDENCE is excluded from the claim-level integrity average
-    # and penalizes the evidence_coverage metric instead.
+PILLARS: Tuple[str, ...] = ("environmental", "social", "governance")
+
+# ─────────────────────────────────────────────────────────
+# Methodology constants (see methodology document for rationale)
+# ─────────────────────────────────────────────────────────
+
+# (base score, band minimum, band maximum) per assessment category.
+# Bands do not overlap, so quality adjustments can never make a partially supported claim
+# outrank a supported one, or an unsubstantiated claim outrank a partially supported one.
+ASSESSMENT_BANDS: Dict[AssessmentCategory, Tuple[float, float, float]] = {
+    AssessmentCategory.SUPPORTED: (90.0, 80.0, 100.0),
+    AssessmentCategory.PARTIALLY_SUPPORTED: (60.0, 50.0, 70.0),
+    AssessmentCategory.UNSUBSTANTIATED: (25.0, 15.0, 35.0),
+    AssessmentCategory.INCONSISTENT: (0.0, 0.0, 0.0),
+    # INSUFFICIENT_EVIDENCE has no band: it is excluded from scores (see evidence coverage).
 }
 
-# Base materiality weights by claim type
+# Materiality weight by claim type: measurable outcomes > commitments > policies > general statements.
 CLAIM_TYPE_MATERIALITY: Dict[str, float] = {
     ClaimType.ACHIEVEMENT.value: 1.5,
-    ClaimType.TARGET.value: 1.3,
     ClaimType.CURRENT_STATE.value: 1.2,
+    ClaimType.TARGET.value: 1.3,
     ClaimType.POLICY.value: 0.9,
     ClaimType.GENERAL.value: 0.6,
 }
+DEFAULT_TYPE_MATERIALITY = 0.6  # unknown claim types are treated as general statements
+QUANTIFIED_MULTIPLIER = 1.2
+SECTOR_PRIORITY_MULTIPLIER = 1.3
 
-# Regex for detecting quantitative specificity (numbers, %, $, units, explicit years)
+# Evidence quality adjustments (points, applied inside the category band)
+ADJ_HIGH_CONFIDENCE = 3.0
+ADJ_LOW_CONFIDENCE = -3.0
+ADJ_HIGH_RELEVANCE = 3.0       # mean cited relevance >= 0.40
+ADJ_LOW_RELEVANCE = -3.0       # mean cited relevance < 0.20
+ADJ_NO_CITATION = -3.0         # non-inconsistent claim with no validated evidence citation
+ADJ_PER_CAVEAT = -2.0
+ADJ_MAX_CAVEAT_TOTAL = -6.0
+ADJ_LIMIT = 10.0
+
+# Quantitative specificity: percentages, currency amounts, numbers with physical/workforce units,
+# or an explicit deadline year ("by 2030"). Bare 4-digit years are deliberately NOT counted:
+# page headers such as "2024 Annual Report" would otherwise mark almost every claim as quantified.
 QUANTITATIVE_PATTERN = re.compile(
-    r"(?:\b\d+(?:\.\d+)?%|\$\s*\d+|\b\d{4}\b|\b\d+(?:\.\d+)?\s*(?:metric\s+tons|ghg|mwh|gwh|kwh|litres|gallons|tons|employees|workers|directors)\b)",
+    r"(?:\d+(?:\.\d+)?\s?%"
+    r"|(?:\$|US\$|GH[S¢₵]|GHC)\s?\d"
+    r"|\b\d[\d,]*(?:\.\d+)?\s*(?:metric\s+tons?|tonnes?|tons?|tco2e?|mwh|gwh|kwh|mw|litres?|liters?|"
+    r"gallons?|m3|hectares?|employees|workers|individuals|people|beneficiaries|directors)\b"
+    r"|\b(?:by|before|until|through)\s+20\d{2}\b)",
     re.I,
 )
 
-# High-priority materiality categories by sector keywords for US SEC SIC and GSE sectors
-SECTOR_MATERIALITY_THEMES: Dict[str, List[str]] = {
-    # Technology / Electronics (e.g. Apple, Google, Scancom)
-    "telecommunications": ["energy", "renewable_energy", "carbon", "emissions", "diversity", "inclusion", "e-waste", "digital inclusion", "supply_chain", "compliance"],
-    "technology": ["energy", "renewable_energy", "carbon", "emissions", "diversity", "inclusion", "e-waste", "supply_chain", "ethics", "compliance"],
-    "electronic computers": ["energy", "renewable_energy", "carbon", "emissions", "diversity", "inclusion", "e-waste", "supply_chain"],
-    # Mining / Extractives (e.g. AngloGold Ashanti)
-    "mining": ["tailings", "water", "galamsey", "mineral", "pollution", "waste", "carbon", "emissions", "health_and_safety", "community", "environmental_management"],
-    # Financial / Banking (e.g. GCB)
-    "banking": ["financial inclusion", "microfinance", "mobile money", "governance", "ethics", "compliance", "transparency", "risk_management", "anti-corruption"],
-    "financial services": ["financial inclusion", "governance", "ethics", "compliance", "transparency", "risk_management"],
-    # Agriculture / Food (e.g. Unilever)
-    "agriculture": ["deforestation", "cocoa", "palm oil", "water", "waste", "packaging", "supply_chain", "smallholder", "labor", "human_rights"],
-    "consumer goods": ["packaging", "waste", "recycling", "plastics", "water", "supply_chain", "energy", "diversity"],
-    # Manufacturing
-    "manufacturing": ["effluent", "industrial waste", "waste", "emissions", "carbon", "energy", "health_and_safety", "labor"],
-    # Oil & Gas
-    "oil_and_gas": ["oil spill", "gas flaring", "carbon", "emissions", "pollution", "offshore", "health_and_safety", "environmental_management"],
-}
+# Sector materiality profiles. Identical profiles apply to US SEC and GSE companies:
+# the market never changes how a claim is scored, only the company's sector does.
+# Each profile: (sector alias pattern, material claim categories, material keywords)
+SECTOR_PROFILES: List[Tuple[str, re.Pattern, set, List[str]]] = [
+    (
+        "mining",
+        re.compile(r"\b(?:mining|mines?|gold|minerals?|metal\s+ores?)\b", re.I),
+        {"water", "pollution", "waste", "biodiversity", "environmental_management",
+         "health_and_safety", "community", "human_rights"},
+        GHANA_ESG_SECTORS["mining"] + ["land rehabilitation", "rehabilitation", "reclamation", "cyanide"],
+    ),
+    (
+        "oil_and_gas",
+        re.compile(r"\b(?:oil|gas|petroleum|crude|refin\w*)\b", re.I),
+        {"emissions", "greenhouse_gas", "carbon", "climate", "pollution", "environmental_management",
+         "health_and_safety", "community"},
+        GHANA_ESG_SECTORS["oil_and_gas"],
+    ),
+    (
+        "agriculture",
+        re.compile(r"\b(?:agricultur\w*|cocoa|plantations?|palm|farming|agro\w*)\b", re.I),
+        {"biodiversity", "water", "supply_chain", "labor", "human_rights", "community"},
+        GHANA_ESG_SECTORS["agriculture"],
+    ),
+    (
+        "banking",
+        re.compile(r"\b(?:bank\w*|financ\w*|insurance|microfinance|savings)\b", re.I),
+        {"governance", "ethics", "compliance", "risk_management", "transparency", "business_conduct",
+         "inclusion"},
+        GHANA_ESG_SECTORS["banking"] + ["anti-money laundering", "data protection"],
+    ),
+    (
+        "telecommunications",
+        re.compile(r"\b(?:telecom\w*|mobile|wireless)\b", re.I),
+        {"energy", "renewable_energy", "carbon", "emissions", "greenhouse_gas", "waste", "inclusion"},
+        GHANA_ESG_SECTORS["telecommunications"] + ["financial inclusion", "mobile money", "data privacy"],
+    ),
+    (
+        "technology",
+        re.compile(r"\b(?:computers?|electronic\w*|software|semiconductors?|technology)\b", re.I),
+        {"energy", "renewable_energy", "carbon", "emissions", "greenhouse_gas", "supply_chain",
+         "recycling", "waste", "human_rights"},
+        ["e-waste", "conflict minerals", "data privacy"],
+    ),
+    (
+        "manufacturing",
+        re.compile(r"\b(?:manufactur\w*|industrial|cement|steel|chemicals?)\b", re.I),
+        {"emissions", "energy", "waste", "pollution", "water", "health_and_safety", "labor"},
+        GHANA_ESG_SECTORS["manufacturing"],
+    ),
+    (
+        "consumer_goods",
+        re.compile(r"\b(?:consumer|beverages?|brewer\w*|food|household|distribution)\b", re.I),
+        {"waste", "recycling", "water", "supply_chain", "circular_economy"},
+        ["packaging", "plastics", "plastic"],
+    ),
+]
+
+
+def _truncate(text: str, limit: int = 90) -> str:
+    """Single-line truncation for human-readable factor strings."""
+    clean = " ".join(text.split())
+    return clean if len(clean) <= limit else clean[: limit - 3] + "..."
+
+
+def _round_score(value: float) -> float:
+    """Round scores to whole points: the methodology does not support finer precision."""
+    return float(round(value))
 
 
 class ScoringService:
@@ -107,36 +184,37 @@ class ScoringService:
         llm_service: Optional[LLMService] = None,
         gse_service: Optional[GSEService] = None,
     ):
-        """Initialize the scoring service."""
         self.settings = settings or get_settings()
         self._llm_service = llm_service
         self._gse_service = gse_service
-
-        # In-memory score storage for caching and history retrieval (no DB required)
+        # In-memory only (no database in this phase). Keys are market-qualified to keep
+        # US SEC and GSE tickers separate.
         self._score_cache: Dict[str, ESGScoreBreakdownResponse] = {}
-        self._score_history: Dict[str, List[ESGIntegrityScoreResponse]] = defaultdict(list)
+        self._score_history: Dict[str, Dict[str, ESGIntegrityScoreResponse]] = {}
 
     @property
     def llm_service(self) -> LLMService:
-        """Lazily initialize LLMService singleton."""
         if self._llm_service is None:
             self._llm_service = get_llm_service()
         return self._llm_service
 
     @property
     def gse_service(self) -> GSEService:
-        """Lazily initialize GSEService singleton."""
         if self._gse_service is None:
             self._gse_service = get_gse_service()
         return self._gse_service
 
     def clear_cache(self) -> None:
-        """Clear all in-memory scoring caches and history."""
+        """Clear in-memory scores and history."""
         self._score_cache.clear()
         self._score_history.clear()
 
+    @staticmethod
+    def _key(market: MarketIdentifier, ticker: str) -> str:
+        return f"{market.value}:{ticker.strip().upper()}"
+
     # ─────────────────────────────────────────────────────────
-    # Core Pure Scoring Calculation Engine
+    # Pure calculation engine
     # ─────────────────────────────────────────────────────────
 
     def calculate_score_from_evaluations(
@@ -151,258 +229,476 @@ class ScoringService:
         industry: Optional[str] = None,
         source_document_references: Optional[List[str]] = None,
     ) -> ESGScoreBreakdownResponse:
-        """Pure calculation engine that computes deterministic ESG Integrity Scores.
+        """Compute the ESG Integrity Score from claim evaluations. Pure and deterministic
+        (apart from the assessment timestamp)."""
+        s = self.settings
+        sector_profile = self._match_sector_profile(sector, industry)
 
-        Takes structured evaluations and disclosure metadata and computes:
-        1. Claim-level integrity scores and materiality weights.
-        2. Pillar-by-pillar dimensional scores (Environmental, Social, Governance).
-        3. Overall materiality-weighted ESG Integrity Score.
-        4. Evidence coverage and analytical confidence rating.
-        5. Explainable positive factors and concerns.
-        """
-        source_refs = source_document_references or []
-        methodology_version = self.settings.SCORING_METHODOLOGY_VERSION
-
-        # Normalize sector/industry context for materiality assessment
-        sector_key = (sector or industry or "").lower()
-
-        # Step 1: Claim-level scoring and classification
-        claim_details: List[ClaimScoreDetail] = []
-        assessable_claims: List[ClaimScoreDetail] = []
-
-        supported_count = 0
-        partially_supported_count = 0
-        inconsistent_count = 0
-        unsubstantiated_count = 0
-        insufficient_evidence_count = 0
-
+        # 1. De-duplicate by claim_id (first occurrence wins) so a claim cannot be counted twice.
+        seen: set = set()
+        unique_evals: List[ClaimEvaluation] = []
         for ev in evaluations:
-            # Assessment counts
-            if ev.assessment == AssessmentCategory.SUPPORTED:
-                supported_count += 1
-            elif ev.assessment == AssessmentCategory.PARTIALLY_SUPPORTED:
-                partially_supported_count += 1
-            elif ev.assessment == AssessmentCategory.INCONSISTENT:
-                inconsistent_count += 1
-            elif ev.assessment == AssessmentCategory.UNSUBSTANTIATED:
-                unsubstantiated_count += 1
-            elif ev.assessment == AssessmentCategory.INSUFFICIENT_EVIDENCE:
-                insufficient_evidence_count += 1
+            if ev.claim_id in seen:
+                continue
+            seen.add(ev.claim_id)
+            unique_evals.append(ev)
+        duplicates_ignored = len(evaluations) - len(unique_evals)
 
-            # Base score
-            base_score = BASE_ASSESSMENT_SCORES.get(ev.assessment, 0.0)
+        # 2. Claim-level scores
+        details = [self._score_claim(ev, sector_profile) for ev in unique_evals]
 
-            # Specificity & quantification check
-            is_quantified = bool(QUANTITATIVE_PATTERN.search(ev.claim_text))
+        counts = {cat: 0 for cat in AssessmentCategory}
+        for d in details:
+            counts[d.assessment] += 1
 
-            # Sector priority match check
-            sector_priority = self._check_sector_priority(ev, sector_key)
+        mapped = [d for d in details if d.category_group.lower() in PILLARS]
+        unmapped_count = len(details) - len(mapped)
+        assessable = [d for d in mapped if d.assessment != AssessmentCategory.INSUFFICIENT_EVIDENCE]
 
-            # Materiality weight calculation
-            type_weight = CLAIM_TYPE_MATERIALITY.get(ev.claim_type, 1.0)
-            quant_multiplier = 1.2 if is_quantified else 1.0
-            sector_multiplier = 1.3 if sector_priority else 1.0
-            materiality_weight = round(type_weight * quant_multiplier * sector_multiplier, 3)
+        total_assessed = len(details)
+        insufficient = counts[AssessmentCategory.INSUFFICIENT_EVIDENCE]
+        evidence_coverage = (
+            _round_score((total_assessed - insufficient) / total_assessed * 100.0) if total_assessed else 0.0
+        )
+        substantiated = sum(
+            1 for d in assessable
+            if d.assessment in (AssessmentCategory.SUPPORTED, AssessmentCategory.PARTIALLY_SUPPORTED)
+        )
+        substantiation_rate = _round_score(substantiated / len(assessable) * 100.0) if assessable else None
 
-            # Evidence quality factor
-            quality_factor = self._compute_evidence_quality_factor(ev)
+        rule_based_n = sum(1 for e in unique_evals if e.evaluation_mode == EvaluationMode.RULE_BASED)
+        llm_n = sum(1 for e in unique_evals if e.evaluation_mode == EvaluationMode.LLM)
+        all_rule_based = bool(unique_evals) and llm_n == 0
 
-            # Claim-level score calculation
-            if ev.assessment == AssessmentCategory.INCONSISTENT:
-                # Contradicted claims strictly score 0.0 with full materiality penalty
-                claim_score = 0.0
-            elif ev.assessment == AssessmentCategory.INSUFFICIENT_EVIDENCE:
-                claim_score = 0.0
-            else:
-                claim_score = round(min(100.0, max(0.0, base_score * quality_factor)), 1)
-
-            ref_ids = [ref.evidence_id for ref in ev.referenced_evidence]
-
-            detail = ClaimScoreDetail(
-                claim_id=ev.claim_id,
-                evaluation_id=ev.evaluation_id,
-                claim_text=ev.claim_text,
-                claim_type=ev.claim_type,
-                category=ev.category,
-                category_group=ev.category_group,
-                assessment=ev.assessment,
-                base_score=base_score,
-                evidence_quality_factor=quality_factor,
-                claim_score=claim_score,
-                materiality_weight=materiality_weight,
-                is_quantified=is_quantified,
-                sector_priority_match=sector_priority,
-                referenced_evidence_ids=ref_ids,
-                caveats_count=len(ev.caveats),
-                reasoning=ev.reasoning,
-            )
-            claim_details.append(detail)
-
-            # Non-insufficient evidence claims are assessable for the integrity score
-            if ev.assessment != AssessmentCategory.INSUFFICIENT_EVIDENCE:
-                assessable_claims.append(detail)
-
-        total_assessed = len(evaluations)
-        total_extracted = total_claims_extracted if total_claims_extracted > 0 else total_assessed
-
-        # Step 2: Evidence Coverage Calculation
-        if total_assessed > 0:
-            evidence_coverage = round(
-                ((total_assessed - insufficient_evidence_count) / total_assessed) * 100.0,
-                1,
-            )
-        else:
-            evidence_coverage = 0.0
-
-        # Step 3: Dimensional Pillar Breakdown (Environmental, Social, Governance)
-        pillar_groups = {
-            ClaimCategoryGroup.ENVIRONMENTAL.value: self.settings.SCORE_WEIGHT_ENVIRONMENTAL,
-            ClaimCategoryGroup.SOCIAL.value: self.settings.SCORE_WEIGHT_SOCIAL,
-            ClaimCategoryGroup.GOVERNANCE.value: self.settings.SCORE_WEIGHT_GOVERNANCE,
+        # 3. Pillar scores (with low-materiality volume damping)
+        base_weights = {
+            "environmental": s.SCORE_WEIGHT_ENVIRONMENTAL,
+            "social": s.SCORE_WEIGHT_SOCIAL,
+            "governance": s.SCORE_WEIGHT_GOVERNANCE,
         }
-
+        raw_pillar_scores: Dict[str, Optional[float]] = {}
         dimensions: Dict[str, DimensionalScore] = {}
-        for pillar_name, configured_weight in pillar_groups.items():
-            dim_score = self._compute_dimensional_score(
-                pillar_name=pillar_name,
-                all_claims=claim_details,
-                configured_weight=configured_weight,
-            )
-            dimensions[pillar_name] = dim_score
+        for pillar in PILLARS:
+            dim, raw = self._score_pillar(pillar, details, base_weights[pillar], all_rule_based)
+            dimensions[pillar] = dim
+            raw_pillar_scores[pillar] = raw
 
-        # Step 4: Overall Score & Status Calculation
-        if len(assessable_claims) == 0:
-            overall_score: Optional[float] = None
-            score_status = ScoreStatus.INSUFFICIENT_DATA
+        # 4. Overall score: configured pillar weights, scaled down for thinly evidenced pillars,
+        #    renormalised over pillars that could be scored.
+        min_claims = max(1, s.SCORE_MIN_ASSESSABLE_CLAIMS)
+        pillar_eff: Dict[str, float] = {}
+        for pillar, dim in dimensions.items():
+            if dim.status == ScoreStatus.SCORED:
+                sufficiency = min(1.0, dim.assessable_claims_count / min_claims)
+                pillar_eff[pillar] = base_weights[pillar] * sufficiency
+        eff_total = sum(pillar_eff.values())
+        for pillar, dim in dimensions.items():
+            dim.effective_weight = round(pillar_eff[pillar] / eff_total, 3) if pillar in pillar_eff and eff_total else 0.0
+
+        insufficient_reason: Optional[str] = None
+        if len(assessable) < min_claims or eff_total <= 0:
+            overall: Optional[float] = None
+            status = ScoreStatus.INSUFFICIENT_DATA
             confidence = ConfidenceLevel.INSUFFICIENT
-        else:
-            score_status = ScoreStatus.SCORED
-
-            # Materiality-weighted score aggregation across all assessable claims
-            total_weight = sum(c.materiality_weight for c in assessable_claims)
-            if total_weight > 0:
-                weighted_sum = sum(c.materiality_weight * c.claim_score for c in assessable_claims)
-                overall_score = round(min(100.0, max(0.0, weighted_sum / total_weight)), 1)
-            else:
-                overall_score = 0.0
-
-            # Confidence determination
-            confidence = self._determine_confidence(
-                assessable_count=len(assessable_claims),
-                evidence_coverage=evidence_coverage,
-                dimensions=dimensions,
+            insufficient_reason = (
+                f"Only {len(assessable)} assessable claim(s) mapped to E/S/G; at least {min_claims} are required "
+                "before an overall score is produced. This reflects limited disclosure data, not a low score."
             )
+        else:
+            overall = _round_score(
+                sum(pillar_eff[p] * raw_pillar_scores[p] for p in pillar_eff) / eff_total
+            )
+            status = ScoreStatus.SCORED
+            confidence = self._overall_confidence(len(assessable), evidence_coverage, dimensions, all_rule_based)
 
-        # Step 5: Effective weights normalization across active dimensions
-        active_pillars = [p for p in dimensions.values() if p.status == ScoreStatus.SCORED]
-        sum_active_weights = sum(p.weight for p in active_pillars)
-        for p in dimensions.values():
-            if p.status == ScoreStatus.SCORED and sum_active_weights > 0:
-                p.effective_weight = round(p.weight / sum_active_weights, 3)
-            else:
-                p.effective_weight = 0.0
-
-        # Step 6: Identify Main Positive Factors and Main Concerns
-        main_positives, main_concerns = self._generate_factors_and_concerns(
-            claim_details=claim_details,
-            dimensions=dimensions,
-            evidence_coverage=evidence_coverage,
-            overall_score=overall_score,
+        positives, concerns = self._factors_and_concerns(
+            details, dimensions, evidence_coverage, substantiation_rate, all_rule_based, insufficient_reason,
         )
 
-        env_score = dimensions.get(ClaimCategoryGroup.ENVIRONMENTAL.value, None)
-        soc_score = dimensions.get(ClaimCategoryGroup.SOCIAL.value, None)
-        gov_score = dimensions.get(ClaimCategoryGroup.GOVERNANCE.value, None)
-
-        response = ESGScoreBreakdownResponse(
+        return ESGScoreBreakdownResponse(
             company_name=company_name,
             ticker=ticker,
             market=market,
             reporting_period=reporting_period,
-            esg_integrity_score=overall_score,
-            score_status=score_status,
+            esg_integrity_score=overall,
+            score_status=status,
             confidence=confidence,
             evidence_coverage=evidence_coverage,
-            environmental_score=env_score.score if env_score else None,
-            social_score=soc_score.score if soc_score else None,
-            governance_score=gov_score.score if gov_score else None,
-            total_claims_extracted=total_extracted,
+            substantiation_rate=substantiation_rate,
+            environmental_score=dimensions["environmental"].score,
+            social_score=dimensions["social"].score,
+            governance_score=dimensions["governance"].score,
+            total_claims_extracted=max(total_claims_extracted, total_assessed),
             total_claims_assessed=total_assessed,
-            supported_claims=supported_count,
-            partially_supported_claims=partially_supported_count,
-            inconsistent_claims=inconsistent_count,
-            unsubstantiated_claims=unsubstantiated_count,
-            insufficient_evidence_claims=insufficient_evidence_count,
-            main_positive_factors=main_positives,
-            main_concerns=main_concerns,
-            methodology_version=methodology_version,
+            supported_claims=counts[AssessmentCategory.SUPPORTED],
+            partially_supported_claims=counts[AssessmentCategory.PARTIALLY_SUPPORTED],
+            inconsistent_claims=counts[AssessmentCategory.INCONSISTENT],
+            unsubstantiated_claims=counts[AssessmentCategory.UNSUBSTANTIATED],
+            insufficient_evidence_claims=insufficient,
+            unmapped_claims=unmapped_count,
+            duplicate_evaluations_ignored=duplicates_ignored,
+            rule_based_evaluations=rule_based_n,
+            llm_evaluations=llm_n,
+            main_positive_factors=positives,
+            main_concerns=concerns,
+            methodology_version=s.SCORING_METHODOLOGY_VERSION,
             assessment_timestamp=datetime.now(timezone.utc).isoformat(),
-            source_document_references=source_refs,
+            source_document_references=source_document_references or [],
             dimensions=dimensions,
-            claim_scores=claim_details,
+            claim_scores=details,
             materiality_summary={
                 "sector": sector,
                 "industry": industry,
-                "sector_priority_matches_count": sum(1 for c in claim_details if c.sector_priority_match),
-                "quantified_claims_count": sum(1 for c in claim_details if c.is_quantified),
-                "base_materiality_weights": CLAIM_TYPE_MATERIALITY,
+                "matched_sector_profile": sector_profile[0] if sector_profile else None,
+                "sector_priority_matches": sum(1 for d in details if d.sector_priority_match),
+                "quantified_claims": sum(1 for d in details if d.is_quantified),
             },
             methodology_details={
-                "version": methodology_version,
-                "base_assessment_scores": {k.value: v for k, v in BASE_ASSESSMENT_SCORES.items()},
-                "dimensional_base_weights": {
-                    "environmental": self.settings.SCORE_WEIGHT_ENVIRONMENTAL,
-                    "social": self.settings.SCORE_WEIGHT_SOCIAL,
-                    "governance": self.settings.SCORE_WEIGHT_GOVERNANCE,
+                "version": s.SCORING_METHODOLOGY_VERSION,
+                "assessment_bands": {
+                    k.value: {"base": v[0], "min": v[1], "max": v[2]} for k, v in ASSESSMENT_BANDS.items()
                 },
-                "confidence_thresholds": {
-                    "high": ">= 6 assessable claims, >= 70% coverage, >= 2 dimensions scored",
-                    "medium": ">= 3 assessable claims, >= 50% coverage",
-                    "low": "< 3 assessable claims or < 50% coverage",
-                },
+                "insufficient_evidence_treatment": "excluded from scores; reduces evidence_coverage",
+                "claim_type_materiality": CLAIM_TYPE_MATERIALITY,
+                "quantified_multiplier": QUANTIFIED_MULTIPLIER,
+                "sector_priority_multiplier": SECTOR_PRIORITY_MULTIPLIER,
+                "low_materiality_threshold": s.SCORE_LOW_MATERIALITY_THRESHOLD,
+                "low_materiality_max_share": s.SCORE_LOW_MATERIALITY_MAX_SHARE,
+                "pillar_base_weights": base_weights,
+                "min_assessable_claims": min_claims,
+                "confidence_capped_for_rule_based": s.SCORE_CAP_CONFIDENCE_FOR_RULE_BASED and all_rule_based,
+                "rounding": "scores and percentages rounded to whole numbers",
             },
         )
 
-        return response
-
     # ─────────────────────────────────────────────────────────
-    # Public SEC & GSE Scoring Workflow Integration
+    # Claim-level scoring
     # ─────────────────────────────────────────────────────────
 
-    def calculate_company_score(
+    def _score_claim(self, ev: ClaimEvaluation, sector_profile) -> ClaimScoreDetail:
+        is_quantified = bool(QUANTITATIVE_PATTERN.search(ev.claim_text))
+        sector_match = self._sector_priority(ev, sector_profile)
+        weight = CLAIM_TYPE_MATERIALITY.get(ev.claim_type, DEFAULT_TYPE_MATERIALITY)
+        if is_quantified:
+            weight *= QUANTIFIED_MULTIPLIER
+        if sector_match:
+            weight *= SECTOR_PRIORITY_MULTIPLIER
+        weight = round(weight, 3)
+
+        adjustment, reasons = 0.0, []
+        if ev.assessment == AssessmentCategory.INSUFFICIENT_EVIDENCE:
+            base, score = 0.0, 0.0
+            reasons.append("Insufficient evidence: excluded from scoring (reflected in evidence coverage).")
+        elif ev.assessment == AssessmentCategory.INCONSISTENT:
+            base, score = 0.0, 0.0
+            reasons.append("Inconsistent: fixed at 0; evidence quality cannot offset a contradiction.")
+        else:
+            base, band_min, band_max = ASSESSMENT_BANDS[ev.assessment]
+            adjustment, reasons = self._quality_adjustment(ev)
+            score = min(band_max, max(band_min, base + adjustment))
+
+        return ClaimScoreDetail(
+            claim_id=ev.claim_id,
+            evaluation_id=ev.evaluation_id,
+            claim_text=ev.claim_text,
+            claim_type=ev.claim_type,
+            category=ev.category,
+            category_group=ev.category_group,
+            assessment=ev.assessment,
+            base_score=base,
+            evidence_quality_adjustment=adjustment,
+            quality_adjustment_reasons=reasons,
+            claim_score=score,
+            materiality_weight=weight,
+            is_quantified=is_quantified,
+            sector_priority_match=sector_match,
+            referenced_evidence_ids=[r.evidence_id for r in ev.referenced_evidence],
+            caveats_count=len(ev.caveats),
+            reasoning=ev.reasoning,
+        )
+
+    @staticmethod
+    def _quality_adjustment(ev: ClaimEvaluation) -> Tuple[float, List[str]]:
+        adj, reasons = 0.0, []
+        if ev.confidence == EvaluationConfidence.HIGH:
+            adj += ADJ_HIGH_CONFIDENCE
+            reasons.append(f"+{ADJ_HIGH_CONFIDENCE:g}: high evaluation confidence")
+        elif ev.confidence == EvaluationConfidence.LOW:
+            adj += ADJ_LOW_CONFIDENCE
+            reasons.append(f"{ADJ_LOW_CONFIDENCE:g}: low evaluation confidence")
+
+        if ev.referenced_evidence:
+            mean_rel = sum(r.relevance_score for r in ev.referenced_evidence) / len(ev.referenced_evidence)
+            if mean_rel >= 0.40:
+                adj += ADJ_HIGH_RELEVANCE
+                reasons.append(f"+{ADJ_HIGH_RELEVANCE:g}: mean cited-evidence relevance {mean_rel:.2f} >= 0.40")
+            elif mean_rel < 0.20:
+                adj += ADJ_LOW_RELEVANCE
+                reasons.append(f"{ADJ_LOW_RELEVANCE:g}: mean cited-evidence relevance {mean_rel:.2f} < 0.20")
+        else:
+            adj += ADJ_NO_CITATION
+            reasons.append(f"{ADJ_NO_CITATION:g}: no validated evidence citation")
+
+        if ev.caveats:
+            caveat_adj = max(ADJ_MAX_CAVEAT_TOTAL, ADJ_PER_CAVEAT * len(ev.caveats))
+            adj += caveat_adj
+            reasons.append(f"{caveat_adj:g}: {len(ev.caveats)} caveat(s) noted in evaluation")
+
+        adj = max(-ADJ_LIMIT, min(ADJ_LIMIT, adj))
+        return adj, reasons
+
+    # ─────────────────────────────────────────────────────────
+    # Sector materiality
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _match_sector_profile(sector: Optional[str], industry: Optional[str]):
+        """Return the first matching sector profile (deterministic order) or None."""
+        text = " ".join(x for x in (sector, industry) if x)
+        if not text:
+            return None
+        for profile in SECTOR_PROFILES:
+            if profile[1].search(text):
+                return profile
+        return None
+
+    @staticmethod
+    def _sector_priority(ev: ClaimEvaluation, profile) -> bool:
+        if profile is None:
+            return False
+        _, _, categories, keywords = profile
+        if ev.category.lower() in categories:
+            return True
+        text = ev.claim_text.lower()
+        return any(re.search(r"\b" + re.escape(kw.lower()) + r"\b", text) for kw in keywords)
+
+    # ─────────────────────────────────────────────────────────
+    # Pillar aggregation
+    # ─────────────────────────────────────────────────────────
+
+    def _score_pillar(
         self,
-        ticker: str,
-    ) -> ESGScoreBreakdownResponse:
-        """Calculate and return full ESG Integrity Score breakdown for a US SEC listed company."""
-        clean_ticker = normalize_and_validate_ticker(ticker)
+        pillar: str,
+        details: List[ClaimScoreDetail],
+        base_weight: float,
+        all_rule_based: bool,
+    ) -> Tuple[DimensionalScore, Optional[float]]:
+        s = self.settings
+        claims = [d for d in details if d.category_group.lower() == pillar]
+        by_cat = {cat: sum(1 for d in claims if d.assessment == cat) for cat in AssessmentCategory}
+        assessable = [d for d in claims if d.assessment != AssessmentCategory.INSUFFICIENT_EVIDENCE]
+        n = len(claims)
+        insufficient = by_cat[AssessmentCategory.INSUFFICIENT_EVIDENCE]
+        coverage = _round_score((n - insufficient) / n * 100.0) if n else 0.0
 
-        # 1. Evaluate filings via Phase 6 LLMService
-        eval_resp: CompanyEvaluationResponse = self.llm_service.evaluate_company_filing(clean_ticker)
+        common = dict(
+            dimension=pillar,
+            weight=base_weight,
+            effective_weight=0.0,
+            claims_count=n,
+            assessable_claims_count=len(assessable),
+            supported_count=by_cat[AssessmentCategory.SUPPORTED],
+            partially_supported_count=by_cat[AssessmentCategory.PARTIALLY_SUPPORTED],
+            inconsistent_count=by_cat[AssessmentCategory.INCONSISTENT],
+            unsubstantiated_count=by_cat[AssessmentCategory.UNSUBSTANTIATED],
+            insufficient_evidence_count=insufficient,
+            evidence_coverage=coverage,
+        )
 
-        company = eval_resp.company
-        source_refs = [
-            f"SEC EDGAR Form {eval_resp.form_type} (Accession: {eval_resp.filing_accession_number}, Filing Date: {eval_resp.filing_date})",
+        if not assessable:
+            reason = (
+                "No claims extracted for this pillar." if n == 0
+                else f"All {n} claim(s) lacked relevant evidence."
+            )
+            return DimensionalScore(
+                **common,
+                score=None,
+                status=ScoreStatus.INSUFFICIENT_DATA,
+                confidence=ConfidenceLevel.INSUFFICIENT,
+                key_factors=[f"Insufficient data: {reason} Pillar not scored (a data gap, not a zero)."],
+            ), None
+
+        # Volume damping: low-materiality claims collectively hold at most MAX_SHARE of pillar weight.
+        threshold = s.SCORE_LOW_MATERIALITY_THRESHOLD
+        share = min(max(s.SCORE_LOW_MATERIALITY_MAX_SHARE, 0.0), 0.95)
+        high = [d for d in assessable if d.materiality_weight >= threshold]
+        low = [d for d in assessable if d.materiality_weight < threshold]
+        high_sum = sum(d.materiality_weight for d in high)
+        low_sum = sum(d.materiality_weight for d in low)
+        low_scale = 1.0
+        if high_sum > 0 and low_sum > 0:
+            cap = high_sum * share / (1.0 - share)
+            if low_sum > cap:
+                low_scale = cap / low_sum
+        for d in high:
+            d.effective_weight = d.materiality_weight
+            d.included_in_score = True
+        for d in low:
+            d.effective_weight = round(d.materiality_weight * low_scale, 4)
+            d.included_in_score = True
+
+        w_total = sum(d.effective_weight for d in assessable)
+        raw = sum(d.effective_weight * d.claim_score for d in assessable) / w_total if w_total else 0.0
+
+        factors: List[str] = []
+        if common["supported_count"]:
+            factors.append(f"{common['supported_count']} claim(s) supported by retrieved evidence.")
+        if common["partially_supported_count"]:
+            factors.append(f"{common['partially_supported_count']} claim(s) partially supported (caveats or scope limits).")
+        if common["inconsistent_count"]:
+            factors.append(f"{common['inconsistent_count']} claim(s) contradicted by retrieved evidence.")
+        if common["unsubstantiated_count"]:
+            factors.append(
+                f"{common['unsubstantiated_count']} claim(s) unsubstantiated: relevant disclosures found but they "
+                "do not establish the claim."
+            )
+        if insufficient:
+            factors.append(f"{insufficient} claim(s) excluded for insufficient evidence.")
+        if low_scale < 1.0:
+            factors.append(
+                f"Volume damping applied: {len(low)} low-materiality statement(s) capped at "
+                f"{int(share * 100)}% of pillar weight."
+            )
+
+        k = len(assessable)
+        if k >= 5 and coverage >= 70:
+            conf = ConfidenceLevel.HIGH
+        elif k >= 3:
+            conf = ConfidenceLevel.MEDIUM
+        else:
+            conf = ConfidenceLevel.LOW
+        if conf == ConfidenceLevel.HIGH and all_rule_based and s.SCORE_CAP_CONFIDENCE_FOR_RULE_BASED:
+            conf = ConfidenceLevel.MEDIUM
+
+        return DimensionalScore(
+            **common,
+            score=_round_score(raw),
+            status=ScoreStatus.SCORED,
+            confidence=conf,
+            key_factors=factors,
+        ), raw
+
+    def _overall_confidence(
+        self,
+        assessable_n: int,
+        coverage: float,
+        dimensions: Dict[str, DimensionalScore],
+        all_rule_based: bool,
+    ) -> ConfidenceLevel:
+        scored_pillars = sum(1 for d in dimensions.values() if d.status == ScoreStatus.SCORED)
+        if assessable_n >= 10 and coverage >= 70 and scored_pillars >= 2:
+            conf = ConfidenceLevel.HIGH
+        elif assessable_n >= 5 and coverage >= 50:
+            conf = ConfidenceLevel.MEDIUM
+        else:
+            conf = ConfidenceLevel.LOW
+        if conf == ConfidenceLevel.HIGH and all_rule_based and self.settings.SCORE_CAP_CONFIDENCE_FOR_RULE_BASED:
+            conf = ConfidenceLevel.MEDIUM
+        return conf
+
+    # ─────────────────────────────────────────────────────────
+    # Explanations (derived only from computed results; no LLM)
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _factors_and_concerns(
+        details: List[ClaimScoreDetail],
+        dimensions: Dict[str, DimensionalScore],
+        coverage: float,
+        substantiation_rate: Optional[float],
+        all_rule_based: bool,
+        insufficient_reason: Optional[str],
+    ) -> Tuple[List[str], List[str]]:
+        positives: List[str] = []
+        concerns: List[str] = []
+        by_weight = sorted(details, key=lambda d: (-d.materiality_weight, d.claim_id))
+
+        for d in [x for x in by_weight if x.assessment == AssessmentCategory.SUPPORTED][:3]:
+            positives.append(
+                f"Supported {d.claim_type} claim ({d.category}, materiality {d.materiality_weight:g}): "
+                f"'{_truncate(d.claim_text)}' [{d.claim_id}]"
+            )
+        for d in [x for x in by_weight if x.assessment == AssessmentCategory.PARTIALLY_SUPPORTED][:2]:
+            positives.append(
+                f"Partially supported {d.claim_type} claim ({d.category}); evidence covers only part of the claim: "
+                f"'{_truncate(d.claim_text)}' [{d.claim_id}]"
+            )
+        for dim in dimensions.values():
+            if dim.score is not None and dim.score >= 70 and dim.assessable_claims_count >= 3:
+                positives.append(
+                    f"{dim.dimension.capitalize()} pillar scored {dim.score:g}/100 across "
+                    f"{dim.assessable_claims_count} assessable claims."
+                )
+
+        if insufficient_reason:
+            concerns.append(insufficient_reason)
+        for d in [x for x in by_weight if x.assessment == AssessmentCategory.INCONSISTENT][:3]:
+            concerns.append(
+                f"Contradicted {d.claim_type} claim ({d.category}): retrieved evidence conflicts with "
+                f"'{_truncate(d.claim_text)}' [{d.claim_id}]"
+            )
+        material_types = {ClaimType.ACHIEVEMENT.value, ClaimType.TARGET.value, ClaimType.CURRENT_STATE.value}
+        for d in [x for x in by_weight
+                  if x.assessment == AssessmentCategory.UNSUBSTANTIATED and x.claim_type in material_types][:3]:
+            concerns.append(
+                f"Unsubstantiated {d.claim_type} claim ({d.category}): retrieved disclosures do not establish "
+                f"'{_truncate(d.claim_text)}' [{d.claim_id}]. This is not a finding that the claim is false."
+            )
+        if substantiation_rate is not None and substantiation_rate < 50:
+            concerns.append(
+                f"Only {substantiation_rate:g}% of assessable claims are supported or partially supported."
+            )
+        insufficient_n = sum(1 for d in details if d.assessment == AssessmentCategory.INSUFFICIENT_EVIDENCE)
+        if insufficient_n:
+            concerns.append(
+                f"{insufficient_n} claim(s) could not be assessed (no relevant evidence retrieved); excluded from "
+                f"the score and reflected in evidence coverage ({coverage:g}%)."
+            )
+        unscored = [d.dimension.capitalize() for d in dimensions.values() if d.status == ScoreStatus.INSUFFICIENT_DATA]
+        if unscored and not insufficient_reason:
+            concerns.append(
+                f"No assessable claims for: {', '.join(unscored)}. These pillars are not scored (data gap, not zero)."
+            )
+        if all_rule_based:
+            concerns.append(
+                "All evaluations were produced by the deterministic rule-based engine (keyword and evidence-relationship "
+                "heuristics, not full reading comprehension); confidence is capped at medium."
+            )
+        return positives, concerns
+
+    # ─────────────────────────────────────────────────────────
+    # SEC and GSE workflow integration
+    # ─────────────────────────────────────────────────────────
+
+    def calculate_company_score(self, ticker: str) -> ESGScoreBreakdownResponse:
+        """Score a US company from its latest SEC annual filing (via existing Phase 6 evaluations)."""
+        clean = normalize_and_validate_ticker(ticker)
+        resp: CompanyEvaluationResponse = self.llm_service.evaluate_company_filing(clean)
+        company = resp.company
+
+        if resp.fiscal_year:
+            period = f"FY{resp.fiscal_year}"
+        elif resp.report_date:
+            period = f"Period ending {resp.report_date}"
+        else:
+            period = None  # not invented from the filing date
+
+        refs = [
+            f"SEC EDGAR Form {resp.form_type}, accession {resp.filing_accession_number}, filed {resp.filing_date}"
+            + (f", period ending {resp.report_date}" if resp.report_date else "")
         ]
-
-        # 2. Compute deterministic score
         breakdown = self.calculate_score_from_evaluations(
             company_name=company.company_name,
             ticker=company.ticker,
             market=MarketIdentifier.US_SEC,
-            evaluations=eval_resp.evaluations,
-            total_claims_extracted=eval_resp.summary.total_claims_extracted,
-            reporting_period=eval_resp.filing_date[:4] if eval_resp.filing_date else None,
+            evaluations=resp.evaluations,
+            total_claims_extracted=resp.summary.total_claims_extracted,
+            reporting_period=period,
             sector=company.sic_description,
-            industry=company.sic,
-            source_document_references=source_refs,
+            industry=None,
+            source_document_references=refs,
         )
-
-        # 3. Cache results and record in history
-        cache_key = f"sec_{clean_ticker}_{eval_resp.filing_accession_number}"
-        self._score_cache[clean_ticker] = breakdown
-        self._score_cache[cache_key] = breakdown
-        self._record_history(clean_ticker, breakdown)
-
+        self._store(MarketIdentifier.US_SEC, clean, resp.filing_accession_number, breakdown)
         return breakdown
 
     def calculate_gse_score(
@@ -412,335 +708,94 @@ class ScoringService:
         source_type: DocumentSourceType = DocumentSourceType.ANNUAL_REPORT,
         reporting_period: Optional[str] = None,
     ) -> ESGScoreBreakdownResponse:
-        """Calculate and return full ESG Integrity Score breakdown for a Ghana Stock Exchange listed company."""
-        from app.services.gse_service import normalize_gse_ticker
-
-        clean_ticker = normalize_gse_ticker(ticker)
-
-        # 1. Analyze GSE document via Phase 7A GSEService
-        gse_resp: GSEAnalysisResponse = self.gse_service.analyze_company_document(
-            ticker=clean_ticker,
+        """Score a GSE company from a disclosure document (via existing Phase 7A analysis pipeline)."""
+        clean = normalize_gse_ticker(ticker)
+        resp: GSEAnalysisResponse = self.gse_service.analyze_company_document(
+            ticker=clean,
             source_url=source_url,
             source_type=source_type,
             reporting_period=reporting_period,
         )
-
-        company: GSECompany = gse_resp.company
-        doc = gse_resp.document
-        source_refs = [
-            f"Ghana Stock Exchange: {doc.title} ({doc.format.upper()}, Period: {doc.reporting_period or 'N/A'}, Doc ID: {doc.document_id})",
+        company: GSECompany = resp.company
+        doc = resp.document
+        refs = [
+            f"{doc.title} ({doc.source_type.value}, {doc.format}, period {doc.reporting_period or 'unknown'}, "
+            f"document_id {doc.document_id})"
         ]
         if doc.source_url:
-            source_refs.append(doc.source_url)
+            refs.append(doc.source_url)
 
-        # 2. Compute deterministic score
         breakdown = self.calculate_score_from_evaluations(
             company_name=company.company_name,
             ticker=company.ticker,
             market=MarketIdentifier.GH_GSE,
-            evaluations=gse_resp.evaluations,
-            total_claims_extracted=gse_resp.total_claims_extracted,
+            evaluations=resp.evaluations,
+            total_claims_extracted=resp.total_claims_extracted,
             reporting_period=doc.reporting_period,
             sector=company.sector,
             industry=company.industry,
-            source_document_references=source_refs,
+            source_document_references=refs,
         )
-
-        # 3. Cache results and record in history
-        cache_key = f"gse_{clean_ticker}_{doc.document_id}"
-        self._score_cache[clean_ticker] = breakdown
-        self._score_cache[cache_key] = breakdown
-        self._record_history(clean_ticker, breakdown)
-
+        self._store(MarketIdentifier.GH_GSE, clean, doc.document_id, breakdown)
         return breakdown
 
-    def get_company_score(
-        self,
-        ticker: str,
-        market: MarketIdentifier = MarketIdentifier.US_SEC,
-    ) -> ESGIntegrityScoreResponse:
-        """Retrieve the primary ESG Integrity Score response for a company (US or GSE)."""
-        clean_ticker = ticker.strip().upper()
-        if clean_ticker in self._score_cache:
-            breakdown = self._score_cache[clean_ticker]
-        else:
-            if market == MarketIdentifier.GH_GSE:
-                breakdown = self.calculate_gse_score(clean_ticker)
-            else:
-                breakdown = self.calculate_company_score(clean_ticker)
+    def _store(self, market: MarketIdentifier, ticker: str, document_key: str, breakdown: ESGScoreBreakdownResponse) -> None:
+        """Cache the latest score and record one history entry per distinct document and
+        methodology version (re-scoring the same document replaces its entry)."""
+        key = self._key(market, ticker)
+        self._score_cache[key] = breakdown
+        entry_key = f"{document_key}|{breakdown.methodology_version}"
+        self._score_history.setdefault(key, {})[entry_key] = self._summary(breakdown)
 
-        return ESGIntegrityScoreResponse(**breakdown.model_dump(exclude={"dimensions", "claim_scores", "materiality_summary", "methodology_details"}))
+    @staticmethod
+    def _summary(breakdown: ESGScoreBreakdownResponse) -> ESGIntegrityScoreResponse:
+        return ESGIntegrityScoreResponse(
+            **breakdown.model_dump(exclude={"dimensions", "claim_scores", "materiality_summary", "methodology_details"})
+        )
 
     def get_company_score_breakdown(
-        self,
-        ticker: str,
-        market: MarketIdentifier = MarketIdentifier.US_SEC,
+        self, ticker: str, market: MarketIdentifier = MarketIdentifier.US_SEC
     ) -> ESGScoreBreakdownResponse:
-        """Retrieve the detailed ESG Integrity Score breakdown with all claim details and pillar metrics."""
-        clean_ticker = ticker.strip().upper()
-        if clean_ticker in self._score_cache:
-            return self._score_cache[clean_ticker]
-
+        cached = self._score_cache.get(self._key(market, ticker))
+        if cached is not None:
+            return cached
         if market == MarketIdentifier.GH_GSE:
-            return self.calculate_gse_score(clean_ticker)
-        return self.calculate_company_score(clean_ticker)
+            return self.calculate_gse_score(ticker)
+        return self.calculate_company_score(ticker)
+
+    def get_company_score(
+        self, ticker: str, market: MarketIdentifier = MarketIdentifier.US_SEC
+    ) -> ESGIntegrityScoreResponse:
+        return self._summary(self.get_company_score_breakdown(ticker, market))
 
     def get_company_score_history(
-        self,
-        ticker: str,
-        market: MarketIdentifier = MarketIdentifier.US_SEC,
+        self, ticker: str, market: MarketIdentifier = MarketIdentifier.US_SEC
     ) -> ESGScoreHistoryResponse:
-        """Retrieve the recorded historical scores for a company."""
-        clean_ticker = ticker.strip().upper()
-        history_list = self._score_history.get(clean_ticker, [])
-
-        company_name = clean_ticker
-        if history_list:
-            company_name = history_list[-1].company_name
-        elif clean_ticker in self._score_cache:
-            company_name = self._score_cache[clean_ticker].company_name
-
+        """Return only assessments actually computed in this process. Never fabricates history."""
+        clean = (
+            normalize_gse_ticker(ticker)
+            if market == MarketIdentifier.GH_GSE
+            else normalize_and_validate_ticker(ticker)
+        )
+        key = self._key(market, clean)
+        entries = sorted(
+            self._score_history.get(key, {}).values(),
+            key=lambda e: (e.reporting_period or "", e.assessment_timestamp),
+        )
         return ESGScoreHistoryResponse(
-            company_name=company_name,
-            ticker=clean_ticker,
+            company_name=entries[-1].company_name if entries else clean,
+            ticker=clean,
             market=market,
-            total_records=len(history_list),
-            history=history_list,
+            total_records=len(entries),
+            history=entries,
+            note=(
+                "History contains only assessments computed by this server process (in-memory; no database in "
+                "this phase). It is cleared on restart. One entry is kept per distinct source document and "
+                "methodology version. No historical scores are estimated or fabricated."
+            ),
         )
 
-    # ─────────────────────────────────────────────────────────
-    # Calculation Helper Methods
-    # ─────────────────────────────────────────────────────────
 
-    def _compute_evidence_quality_factor(self, ev: ClaimEvaluation) -> float:
-        """Calculate quality multiplier based on retrieval relevance, evaluation confidence, and caveats.
-
-        Returns:
-            Quality multiplier clamped strictly within [0.75, 1.15].
-        """
-        factor = 1.0
-
-        # Confidence adjustment
-        if ev.confidence == EvaluationConfidence.HIGH:
-            factor += 0.05
-        elif ev.confidence == EvaluationConfidence.LOW:
-            factor -= 0.05
-
-        # Evidence relevance adjustment
-        if ev.referenced_evidence:
-            avg_rel = sum(ref.relevance_score for ref in ev.referenced_evidence) / len(ev.referenced_evidence)
-            if avg_rel >= 0.40:
-                factor += 0.05
-            elif avg_rel < 0.20:
-                factor -= 0.05
-
-        # Caveats deduction (max deduction -0.15)
-        if ev.caveats:
-            deduction = min(len(ev.caveats) * 0.05, 0.15)
-            factor -= deduction
-
-        return round(min(1.15, max(0.75, factor)), 2)
-
-    def _check_sector_priority(self, ev: ClaimEvaluation, sector_key: str) -> bool:
-        """Determine whether a claim's category aligns with the company's sector priorities."""
-        if not sector_key:
-            return False
-
-        # Match against known sector themes
-        for sector_name, themes in SECTOR_MATERIALITY_THEMES.items():
-            if sector_name in sector_key:
-                claim_cat = ev.category.lower()
-                claim_text_lower = ev.claim_text.lower()
-                if any(t in claim_cat or t in claim_text_lower for t in themes):
-                    return True
-
-        # Also check Ghana ESG sector taxonomy
-        for sector_name, keywords in GHANA_ESG_SECTORS.items():
-            if sector_name in sector_key:
-                claim_text_lower = ev.claim_text.lower()
-                if any(kw in claim_text_lower for kw in keywords):
-                    return True
-
-        return False
-
-    def _compute_dimensional_score(
-        self,
-        pillar_name: str,
-        all_claims: List[ClaimScoreDetail],
-        configured_weight: float,
-    ) -> DimensionalScore:
-        """Calculate score and evidence metrics for a single ESG pillar."""
-        pillar_claims = [c for c in all_claims if c.category_group.lower() == pillar_name.lower()]
-        total_in_pillar = len(pillar_claims)
-
-        supported = sum(1 for c in pillar_claims if c.assessment == AssessmentCategory.SUPPORTED)
-        partially = sum(1 for c in pillar_claims if c.assessment == AssessmentCategory.PARTIALLY_SUPPORTED)
-        inconsistent = sum(1 for c in pillar_claims if c.assessment == AssessmentCategory.INCONSISTENT)
-        unsubstantiated = sum(1 for c in pillar_claims if c.assessment == AssessmentCategory.UNSUBSTANTIATED)
-        insufficient = sum(1 for c in pillar_claims if c.assessment == AssessmentCategory.INSUFFICIENT_EVIDENCE)
-
-        assessable = [c for c in pillar_claims if c.assessment != AssessmentCategory.INSUFFICIENT_EVIDENCE]
-
-        if total_in_pillar > 0:
-            coverage = round(((total_in_pillar - insufficient) / total_in_pillar) * 100.0, 1)
-        else:
-            coverage = 0.0
-
-        key_factors: List[str] = []
-
-        if len(assessable) == 0:
-            return DimensionalScore(
-                dimension=pillar_name,
-                score=None,
-                status=ScoreStatus.INSUFFICIENT_DATA,
-                weight=configured_weight,
-                effective_weight=0.0,
-                claims_count=total_in_pillar,
-                assessable_claims_count=0,
-                supported_count=supported,
-                partially_supported_count=partially,
-                inconsistent_count=inconsistent,
-                unsubstantiated_count=unsubstantiated,
-                insufficient_evidence_count=insufficient,
-                evidence_coverage=coverage,
-                confidence=ConfidenceLevel.INSUFFICIENT,
-                key_factors=["Insufficient disclosure data available to compute a reliable pillar score."],
-            )
-
-        # Materiality-weighted score for this pillar
-        w_sum = sum(c.materiality_weight for c in assessable)
-        if w_sum > 0:
-            score = round(min(100.0, max(0.0, sum(c.materiality_weight * c.claim_score for c in assessable) / w_sum)), 1)
-        else:
-            score = 0.0
-
-        # Factors
-        if supported > 0:
-            key_factors.append(f"{supported} claim(s) directly corroborated with affirmative disclosure evidence.")
-        if partially > 0:
-            key_factors.append(f"{partially} claim(s) partially supported with operational or scope caveats.")
-        if inconsistent > 0:
-            key_factors.append(f"CONCERN: {inconsistent} claim(s) contradicted by disclosed performance metrics.")
-        if unsubstantiated > 0:
-            key_factors.append(f"{unsubstantiated} claim(s) lack formal verification or targets in filing.")
-
-        # Pillar confidence
-        if len(assessable) >= 3 and coverage >= 70.0:
-            dim_conf = ConfidenceLevel.HIGH
-        elif len(assessable) >= 2 and coverage >= 50.0:
-            dim_conf = ConfidenceLevel.MEDIUM
-        else:
-            dim_conf = ConfidenceLevel.LOW
-
-        return DimensionalScore(
-            dimension=pillar_name,
-            score=score,
-            status=ScoreStatus.SCORED,
-            weight=configured_weight,
-            effective_weight=configured_weight,
-            claims_count=total_in_pillar,
-            assessable_claims_count=len(assessable),
-            supported_count=supported,
-            partially_supported_count=partially,
-            inconsistent_count=inconsistent,
-            unsubstantiated_count=unsubstantiated,
-            insufficient_evidence_count=insufficient,
-            evidence_coverage=coverage,
-            confidence=dim_conf,
-            key_factors=key_factors,
-        )
-
-    def _determine_confidence(
-        self,
-        assessable_count: int,
-        evidence_coverage: float,
-        dimensions: Dict[str, DimensionalScore],
-    ) -> ConfidenceLevel:
-        """Determine analytical confidence level based on claim count, coverage, and pillar diversity."""
-        if assessable_count == 0:
-            return ConfidenceLevel.INSUFFICIENT
-
-        # Small sample guard: fewer than 3 claims can never achieve HIGH confidence
-        if assessable_count < 3:
-            return ConfidenceLevel.LOW
-
-        scored_dimensions = sum(1 for d in dimensions.values() if d.status == ScoreStatus.SCORED)
-
-        if assessable_count >= 6 and evidence_coverage >= 70.0 and scored_dimensions >= 2:
-            return ConfidenceLevel.HIGH
-
-        if assessable_count >= 3 and evidence_coverage >= 50.0:
-            return ConfidenceLevel.MEDIUM
-
-        return ConfidenceLevel.LOW
-
-    def _generate_factors_and_concerns(
-        self,
-        claim_details: List[ClaimScoreDetail],
-        dimensions: Dict[str, DimensionalScore],
-        evidence_coverage: float,
-        overall_score: Optional[float],
-    ) -> Tuple[List[str], List[str]]:
-        """Generate human-readable analytical factors and concerns."""
-        positives: List[str] = []
-        concerns: List[str] = []
-
-        # 1. Inspect supported claims
-        supported_material = [c for c in claim_details if c.assessment == AssessmentCategory.SUPPORTED and c.materiality_weight >= 1.5]
-        if supported_material:
-            sample = supported_material[0]
-            clean_text = sample.claim_text.replace("\n", " ").strip()
-            if len(clean_text) > 90:
-                clean_text = clean_text[:87] + "..."
-            positives.append(f"Substantiated high-materiality {sample.category} claim: '{clean_text}'")
-
-        # 2. Check strong dimensional scores
-        for d in dimensions.values():
-            if d.score is not None and d.score >= 75.0:
-                positives.append(f"Strong disclosure integrity in {d.dimension.capitalize()} pillar (Score: {d.score}/100, {d.supported_count} supported claims).")
-
-        # 3. High coverage
-        if evidence_coverage >= 80.0:
-            positives.append(f"High evidence coverage ({evidence_coverage}%): majority of sustainability claims are corroborated by filing disclosures.")
-
-        if not positives:
-            positives.append("Filing provides baseline sustainability disclosures for review.")
-
-        # 4. Inconsistent claims (always top concern)
-        inconsistent_claims = [c for c in claim_details if c.assessment == AssessmentCategory.INCONSISTENT]
-        for inc in inconsistent_claims[:2]:
-            clean_text = inc.claim_text.replace("\n", " ").strip()
-            if len(clean_text) > 85:
-                clean_text = clean_text[:82] + "..."
-            concerns.append(f"CONTRADICTION: Disclosed filing data contradicts {inc.category} claim: '{clean_text}'")
-
-        # 5. Unsubstantiated high-materiality claims
-        unsubstantiated_targets = [c for c in claim_details if c.assessment == AssessmentCategory.UNSUBSTANTIATED and c.claim_type in {ClaimType.TARGET.value, ClaimType.ACHIEVEMENT.value}]
-        if unsubstantiated_targets:
-            sample = unsubstantiated_targets[0]
-            clean_text = sample.claim_text.replace("\n", " ").strip()
-            if len(clean_text) > 85:
-                clean_text = clean_text[:82] + "..."
-            concerns.append(f"UNSUBSTANTIATED: High-impact {sample.category} commitment lacks milestone targets or verification: '{clean_text}'")
-
-        # 6. Low coverage
-        if evidence_coverage < 50.0:
-            concerns.append(f"Low evidence coverage ({evidence_coverage}%): significant proportion of claims lack corroborating evidence passages.")
-
-        # 7. Unscored pillars
-        unscored_pillars = [d.dimension.capitalize() for d in dimensions.values() if d.status == ScoreStatus.INSUFFICIENT_DATA]
-        if unscored_pillars:
-            concerns.append(f"Missing disclosure data in {', '.join(unscored_pillars)} pillar(s).")
-
-        return positives, concerns
-
-    def _record_history(self, ticker: str, breakdown: ESGScoreBreakdownResponse) -> None:
-        """Append an evaluation result to the in-memory history cache."""
-        summary_resp = ESGIntegrityScoreResponse(**breakdown.model_dump(exclude={"dimensions", "claim_scores", "materiality_summary", "methodology_details"}))
-        self._score_history[ticker].append(summary_resp)
-
-
-# Singleton instance
 _scoring_service_instance: Optional[ScoringService] = None
 
 

@@ -143,6 +143,8 @@ class CompanyEvaluationResponse(BaseModel):
     filing_accession_number: str = Field(..., description="SEC EDGAR filing accession number")
     form_type: str = Field(..., description="Filing type (e.g. 10-K)")
     filing_date: str = Field(..., description="Filing date (YYYY-MM-DD)")
+    report_date: Optional[str] = Field(None, description="Fiscal period end date (YYYY-MM-DD) if known")
+    fiscal_year: Optional[int] = Field(None, description="Fiscal year of the filing if known")
     summary: EvaluationSummary = Field(..., description="Assessment breakdown counts")
     evaluations: List[ClaimEvaluation] = Field(..., description="Detailed evaluations for each claim")
     provider_mode: str = Field(..., description="Active execution mode: 'llm' or 'rule_based'")

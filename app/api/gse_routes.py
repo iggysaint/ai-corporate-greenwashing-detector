@@ -23,6 +23,7 @@ from app.models.market import (
 from app.models.scoring import (
     ESGIntegrityScoreResponse,
     ESGScoreBreakdownResponse,
+    ESGScoreHistoryResponse,
 )
 from app.services.gse_service import GSEService, get_gse_service
 from app.services.scoring_service import ScoringService, get_scoring_service
@@ -150,8 +151,27 @@ def get_gse_company_score(
             source_url=source_url,
             reporting_period=reporting_period,
         )
-        return ESGIntegrityScoreResponse(**breakdown.model_dump(exclude={"dimensions", "claim_scores", "materiality_summary", "methodology_details"}))
+        return ESGIntegrityScoreResponse(
+            **breakdown.model_dump(exclude={"dimensions", "claim_scores", "materiality_summary", "methodology_details"})
+        )
     return scoring_service.get_company_score(ticker=ticker, market=MarketIdentifier.GH_GSE)
+
+
+@router.get(
+    "/companies/{ticker}/score/history",
+    response_model=ESGScoreHistoryResponse,
+    summary="Get GSE Company ESG Integrity Score History",
+    description=(
+        "Return only ESG Integrity assessments actually computed by this server process for the GSE company "
+        "(in-memory; no database in this phase). Historical scores are never estimated or fabricated."
+    ),
+)
+def get_gse_company_score_history(
+    ticker: str,
+    scoring_service: ScoringService = Depends(get_scoring_service),
+) -> ESGScoreHistoryResponse:
+    """Return recorded GSE scoring history."""
+    return scoring_service.get_company_score_history(ticker=ticker, market=MarketIdentifier.GH_GSE)
 
 
 @router.get(

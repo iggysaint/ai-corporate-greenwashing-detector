@@ -69,11 +69,3 @@ class SSRFSecurityError(SecurityValidationError):
     """Raised when an external request targets private, local, or restricted network ranges."""
 
 
-class ScoringServiceError(GreenwashingDetectorError):
-    """Base error for scoring service operations."""
-
-
-class InsufficientDataError(ScoringServiceError):
-    """Raised when scoring calculation cannot proceed due to complete absence of claims."""
-
-

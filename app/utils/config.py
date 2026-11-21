@@ -44,11 +44,18 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.0
     EVALUATION_CACHE_IN_MEMORY: bool = True
 
-    # Scoring Engine Configuration
+    # Scoring Engine Configuration (rationale documented in docs/ESG_INTEGRITY_SCORE_METHODOLOGY.md)
     SCORE_WEIGHT_ENVIRONMENTAL: float = 0.40
     SCORE_WEIGHT_SOCIAL: float = 0.35
     SCORE_WEIGHT_GOVERNANCE: float = 0.25
     SCORING_METHODOLOGY_VERSION: str = "1.0.0"
+    # Minimum assessable (non-insufficient-evidence, E/S/G-mapped) claims before an overall score is produced
+    SCORE_MIN_ASSESSABLE_CLAIMS: int = 3
+    # Low-materiality claims (weight below threshold) may hold at most this share of a pillar's weight
+    SCORE_LOW_MATERIALITY_THRESHOLD: float = 1.0
+    SCORE_LOW_MATERIALITY_MAX_SHARE: float = 0.25
+    # Confidence is capped at MEDIUM when every evaluation is rule-based (keyword heuristics, not reading comprehension)
+    SCORE_CAP_CONFIDENCE_FOR_RULE_BASED: bool = True
 
     # Future Database Integration
     DATABASE_URL: Optional[str] = None

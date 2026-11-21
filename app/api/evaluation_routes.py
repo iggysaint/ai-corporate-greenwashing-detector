@@ -105,6 +105,8 @@ def get_company_evaluations(
         filing_accession_number=response.filing_accession_number,
         form_type=response.form_type,
         filing_date=response.filing_date,
+        report_date=response.report_date,
+        fiscal_year=response.fiscal_year,
         summary=response.summary,
         evaluations=filtered_evals,
         provider_mode=response.provider_mode,

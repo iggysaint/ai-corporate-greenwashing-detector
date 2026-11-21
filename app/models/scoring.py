@@ -86,15 +86,35 @@ class ClaimScoreDetail(BaseModel):
     category: str = Field(..., description="Thematic ESG category")
     category_group: str = Field(..., description="ESG pillar (environmental, social, governance)")
     assessment: AssessmentCategory = Field(..., description="Evaluation outcome")
-    base_score: float = Field(..., ge=0.0, le=100.0, description="Unadjusted baseline score from assessment")
-    evidence_quality_factor: float = Field(
+    base_score: float = Field(..., ge=0.0, le=100.0, description="Baseline score for the assessment category")
+    evidence_quality_adjustment: float = Field(
         ...,
-        ge=0.7,
-        le=1.3,
-        description="Adjustment multiplier based on evidence relevance and caveats",
+        ge=-10.0,
+        le=10.0,
+        description=(
+            "Bounded additive adjustment (points) from evaluation confidence, cited-evidence relevance "
+            "and caveats. The adjusted score is clamped to the assessment category's band, so evidence "
+            "quality can never move a claim into a different assessment category's range."
+        ),
+    )
+    quality_adjustment_reasons: List[str] = Field(
+        default_factory=list,
+        description="Human-readable reasons for each evidence quality adjustment applied",
     )
     claim_score: float = Field(..., ge=0.0, le=100.0, description="Adjusted claim integrity score")
-    materiality_weight: float = Field(..., ge=0.0, description="Composite materiality weight")
+    materiality_weight: float = Field(..., ge=0.0, description="Composite materiality weight before volume damping")
+    effective_weight: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Weight actually applied in pillar aggregation after low-materiality volume damping. "
+            "0.0 for insufficient-evidence claims and claims not mapped to an ESG pillar."
+        ),
+    )
+    included_in_score: bool = Field(
+        False,
+        description="Whether this claim contributed to a pillar score and the overall score",
+    )
     is_quantified: bool = Field(False, description="Whether claim includes specific numerical targets or metrics")
     sector_priority_match: bool = Field(False, description="Whether claim aligns with high-materiality sector themes")
     referenced_evidence_ids: List[str] = Field(
@@ -126,7 +146,19 @@ class ESGIntegrityScoreResponse(BaseModel):
         ...,
         ge=0.0,
         le=100.0,
-        description="Percentage of extracted claims with corroborating or qualifying evidence",
+        description=(
+            "Percentage of assessed claims for which relevant disclosure evidence was retrieved "
+            "(i.e. not 'insufficient_evidence'). Coverage measures data availability, NOT corroboration."
+        ),
+    )
+    substantiation_rate: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Percentage of assessable claims rated supported or partially supported. "
+            "None when there are no assessable claims."
+        ),
     )
 
     # Pillar scores
@@ -142,6 +174,16 @@ class ESGIntegrityScoreResponse(BaseModel):
     inconsistent_claims: int = Field(0, description="Claims contradicted by disclosed facts or metrics")
     unsubstantiated_claims: int = Field(0, description="Claims with inadequate substantiation in disclosures")
     insufficient_evidence_claims: int = Field(0, description="Claims with no relevant evidence found")
+    unmapped_claims: int = Field(
+        0,
+        description="Assessed claims whose category is not mapped to E, S or G (excluded from scores)",
+    )
+    duplicate_evaluations_ignored: int = Field(
+        0,
+        description="Evaluations ignored because their claim_id was already scored (prevents double counting)",
+    )
+    rule_based_evaluations: int = Field(0, description="Evaluations produced by the deterministic rule-based engine")
+    llm_evaluations: int = Field(0, description="Evaluations produced by the LLM evaluator")
 
     # Analytical factors
     main_positive_factors: List[str] = Field(

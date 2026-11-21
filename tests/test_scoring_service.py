@@ -1,40 +1,22 @@
-"""Comprehensive unit tests for Phase 8 ESG Integrity Scoring Engine.
+"""Tests for the Phase 8 ESG Integrity Scoring Engine.
 
-Tests:
-1. Strongly supported claims (high score)
-2. Partially supported claims (moderate score with caveats)
-3. Contradictory evidence / Inconsistent claims (heavily penalized, 0 score for contradiction)
-4. Unsubstantiated claims (partial credit 25.0, not zero/fraud)
-5. Insufficient evidence claims (penalizes coverage, not treated as inconsistent)
-6. Zero claims / No sustainability claims (returns explicit insufficient_data status, None score)
-7. Claims across all 3 ESG dimensions (Environmental, Social, Governance)
-8. Missing information from one dimension (unscored pillar returns insufficient_data without crashing)
-9. Small number of highly material claims vs many low-materiality claims (materiality weighting)
-10. Volume damping (preventing low-materiality claim-stuffing from dominating)
-11. Different reporting periods
-12. Sector priority materiality boost (e.g., Ghana mining, telco, US tech)
-13. Ghanaian companies (GSE MarketIdentifier and sector taxonomy)
-14. US companies (SEC MarketIdentifier and SIC sector taxonomy)
-15. Invalid / edge case inputs
-16. Deterministic repeatability (identical inputs produce identical scores)
-17. Boundary conditions (clamped to 0-100, rounding to 1 decimal place)
-18. Evidence traceability (claim_id, evaluation_id, evidence_id, source references)
-19. Confidence calculation logic and small-sample guard (fewer than 3 claims can never achieve HIGH confidence)
-20. Evidence coverage calculation
-21. All new API endpoints via TestClient:
-    - GET /api/v1/companies/{ticker}/score
-    - GET /api/v1/companies/{ticker}/score/breakdown
-    - GET /api/v1/companies/{ticker}/score/history
-    - GET /api/v1/gse/companies/{ticker}/score
-    - GET /api/v1/gse/companies/{ticker}/score/breakdown
+Exact expected values are hand-computed from the documented methodology
+(docs/ESG_INTEGRITY_SCORE_METHODOLOGY.md) so that formula regressions fail loudly.
+
+Reference claim scores used throughout (no caveats unless stated):
+    supported,   high confidence, cited relevance 0.45  -> 90 + 3 + 3 = 96
+    partially,   medium confidence, relevance 0.35, 1 caveat -> 60 + 0 + 0 - 2 = 58
+    unsubstantiated, medium confidence, no citation       -> 25 - 3 = 22
+    inconsistent                                          -> 0 (fixed)
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
+
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.main import app
-from app.models.claim import ClaimCategoryGroup, ClaimType
 from app.models.company import Company
 from app.models.evaluation import (
     AssessmentCategory,
@@ -52,788 +34,615 @@ from app.models.market import (
     MarketDocument,
     MarketIdentifier,
 )
-from app.models.scoring import (
-    ConfidenceLevel,
-    ESGIntegrityScoreResponse,
-    ESGScoreBreakdownResponse,
-    ScoreStatus,
-)
-from app.services.scoring_service import ScoringService
+from app.models.scoring import ConfidenceLevel, ScoreStatus
+from app.services.scoring_service import QUANTITATIVE_PATTERN, ScoringService, get_scoring_service
+
+A = AssessmentCategory
+C = EvaluationConfidence
 
 client = TestClient(app)
 
 
 # ─────────────────────────────────────────────────────────
-# Test Fixtures & Helpers
+# Helpers
 # ─────────────────────────────────────────────────────────
 
-def create_eval(
-    claim_id: str,
-    claim_text: str,
-    claim_type: str = "achievement",
-    category: str = "carbon",
-    category_group: str = "environmental",
-    assessment: AssessmentCategory = AssessmentCategory.SUPPORTED,
-    confidence: EvaluationConfidence = EvaluationConfidence.HIGH,
-    caveats: list[str] = None,
-    referenced_evidence: list[EvidenceReference] = None,
-    reasoning: str = "Affirmative disclosure matches claim.",
-) -> ClaimEvaluation:
-    """Helper to construct a ClaimEvaluation for scoring tests."""
-    return ClaimEvaluation(
-        evaluation_id=f"eval_{claim_id}",
-        claim_id=claim_id,
-        company_ticker="TEST",
-        company_name="Test Corp",
-        claim_text=claim_text,
-        claim_type=claim_type,
-        category=category,
-        category_group=category_group,
-        assessment=assessment,
-        confidence=confidence,
-        reasoning=reasoning,
-        caveats=caveats or [],
-        referenced_evidence=referenced_evidence or [],
-        evaluation_mode=EvaluationMode.RULE_BASED,
-    )
-
-
-def sample_evidence_ref(ev_id: str = "ev_1", relevance: float = 0.45) -> EvidenceReference:
-    """Helper to construct an EvidenceReference."""
+def ref(ev_id: str = "ev_1", relevance: float = 0.45) -> EvidenceReference:
     return EvidenceReference(
         evidence_id=ev_id,
         section_id="item_1",
         relevance_score=relevance,
         relationship="supporting",
-        quote="Disclosed 15.8% carbon reduction relative to 2021 baseline.",
+        quote="Verbatim evidence excerpt.",
     )
 
 
-# ─────────────────────────────────────────────────────────
-# 1. Strongly Supported Claims (High Score)
-# ─────────────────────────────────────────────────────────
+def ev(
+    claim_id: str,
+    assessment: AssessmentCategory = A.SUPPORTED,
+    *,
+    text: str = "The company expanded its environmental programme.",
+    claim_type: str = "achievement",
+    category: str = "carbon",
+    group: str = "environmental",
+    confidence: EvaluationConfidence = None,
+    caveats=None,
+    refs=None,
+    mode: EvaluationMode = EvaluationMode.RULE_BASED,
+) -> ClaimEvaluation:
+    """Build an evaluation. Defaults reproduce the reference scores in the module docstring."""
+    defaults = {
+        A.SUPPORTED: (C.HIGH, [ref(f"ev_{claim_id}", 0.45)], []),
+        A.PARTIALLY_SUPPORTED: (C.MEDIUM, [ref(f"ev_{claim_id}", 0.35)], ["Scope limited to one site."]),
+        A.UNSUBSTANTIATED: (C.MEDIUM, [], []),
+        A.INCONSISTENT: (C.HIGH, [ref(f"ev_{claim_id}", 0.6)], []),
+        A.INSUFFICIENT_EVIDENCE: (C.LOW, [], []),
+    }
+    d_conf, d_refs, d_cav = defaults[assessment]
+    return ClaimEvaluation(
+        evaluation_id=f"eval_{claim_id}",
+        claim_id=claim_id,
+        company_ticker="TEST",
+        company_name="Test Corp",
+        claim_text=text,
+        claim_type=claim_type,
+        category=category,
+        category_group=group,
+        assessment=assessment,
+        confidence=confidence or d_conf,
+        reasoning="Reasoning grounded in cited evidence.",
+        caveats=d_cav if caveats is None else caveats,
+        referenced_evidence=d_refs if refs is None else refs,
+        evaluation_mode=mode,
+    )
 
-def test_strongly_supported_claims_high_score():
-    """A company with all supported claims receives a high integrity score."""
-    service = ScoringService()
-    evals = [
-        create_eval(
-            claim_id="c1",
-            claim_text="We reduced carbon emissions by 15.8% in 2024.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="carbon",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref("ev_1", 0.50)],
-        ),
-        create_eval(
-            claim_id="c2",
-            claim_text="Achieved 50% female representation on our Board of Directors.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="diversity",
-            category_group=ClaimCategoryGroup.SOCIAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref("ev_2", 0.45)],
-        ),
-        create_eval(
-            claim_id="c3",
-            claim_text="Maintained 100% compliance with SEC governance standards.",
-            claim_type=ClaimType.POLICY.value,
-            category="governance",
-            category_group=ClaimCategoryGroup.GOVERNANCE.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref("ev_3", 0.40)],
-        ),
-    ]
 
-    result = service.calculate_score_from_evaluations(
-        company_name="Clean Future Corp",
-        ticker="CLEAN",
-        market=MarketIdentifier.US_SEC,
+def score(evals, sector=None, market=MarketIdentifier.US_SEC, total=None, period=None, service=None):
+    service = service or ScoringService()
+    return service.calculate_score_from_evaluations(
+        company_name="Test Corp",
+        ticker="TEST",
+        market=market,
         evaluations=evals,
-        total_claims_extracted=3,
+        total_claims_extracted=len(evals) if total is None else total,
+        reporting_period=period,
+        sector=sector,
+        source_document_references=["SEC EDGAR Form 10-K, accession 0000000000-26-000001"],
     )
 
-    assert result.score_status == ScoreStatus.SCORED
-    assert result.esg_integrity_score is not None
-    assert result.esg_integrity_score >= 95.0
-    assert result.supported_claims == 3
-    assert result.inconsistent_claims == 0
-    assert result.evidence_coverage == 100.0
+
+# ─────────────────────────────────────────────────────────
+# Claim-level scoring and assessment categories
+# ─────────────────────────────────────────────────────────
+
+def test_reference_claim_scores_exact():
+    r = score([
+        ev("s", A.SUPPORTED), ev("p", A.PARTIALLY_SUPPORTED),
+        ev("u", A.UNSUBSTANTIATED), ev("i", A.INCONSISTENT),
+    ])
+    by_id = {c.claim_id: c for c in r.claim_scores}
+    assert by_id["s"].claim_score == 96
+    assert by_id["p"].claim_score == 58
+    assert by_id["u"].claim_score == 22
+    assert by_id["i"].claim_score == 0
+    assert by_id["s"].quality_adjustment_reasons  # adjustments are explained
+
+
+def test_strongly_supported_company():
+    r = score([ev(f"s{i}", A.SUPPORTED) for i in range(5)])
+    assert r.score_status == ScoreStatus.SCORED
+    assert r.esg_integrity_score == 96
+    assert r.supported_claims == 5
+    assert r.substantiation_rate == 100
+
+
+def test_partially_supported_company():
+    r = score([ev(f"p{i}", A.PARTIALLY_SUPPORTED) for i in range(4)])
+    assert r.esg_integrity_score == 58
+    assert r.partially_supported_claims == 4
+    assert any("Partially supported" in p for p in r.main_positive_factors)
+
+
+def test_mixed_company_exact_weighted_score():
+    # Single pillar, equal weights (1.5 achievement, unquantified): (96 + 58 + 22) / 3 = 58.67 -> 59
+    r = score([ev("s", A.SUPPORTED), ev("p", A.PARTIALLY_SUPPORTED), ev("u", A.UNSUBSTANTIATED)])
+    assert r.esg_integrity_score == 59
+
+
+def test_contradictory_evidence_company():
+    r = score([ev(f"i{i}", A.INCONSISTENT) for i in range(3)])
+    assert r.esg_integrity_score == 0
+    assert r.inconsistent_claims == 3
+    assert sum("Contradicted" in c for c in r.main_concerns) == 3
+
+
+def test_inconsistent_not_rescued_by_evidence_quality():
+    r = score([ev("i", A.INCONSISTENT, confidence=C.HIGH, refs=[ref("x", 0.99)])])
+    assert r.claim_scores[0].claim_score == 0
+    assert r.claim_scores[0].evidence_quality_adjustment == 0
+
+
+def test_unsubstantiated_is_partial_credit_not_false():
+    r = score([ev(f"u{i}", A.UNSUBSTANTIATED) for i in range(3)])
+    assert r.esg_integrity_score == 22  # strictly above inconsistent (0)
+    concern = next(c for c in r.main_concerns if c.startswith("Unsubstantiated"))
+    assert "not a finding that the claim is false" in concern
+
+
+def test_insufficient_evidence_excluded_from_score_and_reduces_coverage():
+    base = score([ev(f"s{i}") for i in range(3)])
+    with_insufficient = score([ev(f"s{i}") for i in range(3)] + [ev("x", A.INSUFFICIENT_EVIDENCE)])
+    with_inconsistent = score([ev(f"s{i}") for i in range(3)] + [ev("x", A.INCONSISTENT)])
+
+    assert with_insufficient.esg_integrity_score == base.esg_integrity_score == 96
+    assert with_insufficient.evidence_coverage == 75
+    assert with_inconsistent.esg_integrity_score < with_insufficient.esg_integrity_score
+    assert with_insufficient.insufficient_evidence_claims == 1
+    assert next(c for c in with_insufficient.claim_scores if c.claim_id == "x").included_in_score is False
+
+
+def test_assessment_bands_do_not_overlap():
+    best_partial = score([ev("p", A.PARTIALLY_SUPPORTED, confidence=C.HIGH, refs=[ref("e", 0.9)], caveats=[])])
+    worst_supported = score([ev("s", A.SUPPORTED, confidence=C.LOW, refs=[ref("e", 0.1)], caveats=["a", "b", "c"])])
+    best_unsub = score([ev("u", A.UNSUBSTANTIATED, confidence=C.HIGH, refs=[ref("e", 0.9)])])
+    assert best_partial.claim_scores[0].claim_score == 66
+    assert worst_supported.claim_scores[0].claim_score == 80
+    assert best_unsub.claim_scores[0].claim_score == 31
+    assert worst_supported.claim_scores[0].claim_score > best_partial.claim_scores[0].claim_score
+    assert best_partial.claim_scores[0].claim_score > best_unsub.claim_scores[0].claim_score
+
+
+def test_supported_claim_without_citation_is_penalised():
+    r = score([ev("s", A.SUPPORTED, refs=[])])
+    assert r.claim_scores[0].claim_score == 90  # 90 + 3 (high conf) - 3 (no citation)
 
 
 # ─────────────────────────────────────────────────────────
-# 2. Partially Supported Claims (Moderate Score)
+# Missing information / insufficient data
 # ─────────────────────────────────────────────────────────
 
-def test_partially_supported_claims():
-    """Partially supported claims with caveats produce a moderate score."""
-    service = ScoringService()
-    evals = [
-        create_eval(
-            claim_id="c1",
-            claim_text="Our operations are powered by 100% renewable electricity.",
-            claim_type=ClaimType.TARGET.value,
-            category="renewable_energy",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.PARTIALLY_SUPPORTED,
-            caveats=["Data center scope only; manufacturing facilities excluded."],
-            referenced_evidence=[sample_evidence_ref("ev_1", 0.35)],
-        ),
-        create_eval(
-            claim_id="c2",
-            claim_text="We achieved 40% female leadership representation.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="diversity",
-            category_group=ClaimCategoryGroup.SOCIAL.value,
-            assessment=AssessmentCategory.PARTIALLY_SUPPORTED,
-            caveats=["Excludes subsidiary operations in emerging markets."],
-            referenced_evidence=[sample_evidence_ref("ev_2", 0.38)],
-        ),
-    ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="Caveat Corp",
-        ticker="CAVT",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=2,
-    )
-
-    assert result.score_status == ScoreStatus.SCORED
-    assert result.esg_integrity_score is not None
-    assert 50.0 <= result.esg_integrity_score <= 70.0
-    assert result.partially_supported_claims == 2
+def test_no_sustainability_claims_returns_insufficient_data_not_zero():
+    r = score([], total=0)
+    assert r.score_status == ScoreStatus.INSUFFICIENT_DATA
+    assert r.esg_integrity_score is None
+    assert r.confidence == ConfidenceLevel.INSUFFICIENT
+    assert r.evidence_coverage == 0
+    assert r.substantiation_rate is None
+    assert all(d.score is None for d in r.dimensions.values())
 
 
-# ─────────────────────────────────────────────────────────
-# 3. Contradictory Evidence / Inconsistent Claims
-# ─────────────────────────────────────────────────────────
-
-def test_contradictory_inconsistent_evidence():
-    """Inconsistent claims score 0.0 with full materiality weight and trigger major concerns."""
-    service = ScoringService()
-    evals = [
-        create_eval(
-            claim_id="c1",
-            claim_text="We have reduced net carbon emissions to zero.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="carbon",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.INCONSISTENT,
-            referenced_evidence=[sample_evidence_ref("ev_1", 0.60)],
-            reasoning="Disclosed filing metrics show Scope 1 and 2 emissions actually increased 14%.",
-        ),
-        create_eval(
-            claim_id="c2",
-            claim_text="Zero workplace fatalities recorded in 2024.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="health_and_safety",
-            category_group=ClaimCategoryGroup.SOCIAL.value,
-            assessment=AssessmentCategory.INCONSISTENT,
-            referenced_evidence=[sample_evidence_ref("ev_2", 0.55)],
-            reasoning="Item 1A disclosures report two fatal industrial accidents at contractor facilities.",
-        ),
-    ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="Bad Faith Corp",
-        ticker="BAD",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=2,
-    )
-
-    assert result.score_status == ScoreStatus.SCORED
-    assert result.esg_integrity_score == 0.0
-    assert result.inconsistent_claims == 2
-    assert any("CONTRADICTION" in concern for concern in result.main_concerns)
+def test_all_insufficient_evidence_returns_insufficient_data():
+    r = score([ev(f"x{i}", A.INSUFFICIENT_EVIDENCE) for i in range(5)])
+    assert r.score_status == ScoreStatus.INSUFFICIENT_DATA
+    assert r.esg_integrity_score is None
+    assert r.evidence_coverage == 0
 
 
-# ─────────────────────────────────────────────────────────
-# 4. Unsubstantiated Claims (Inadequate Proof, Not Fraud)
-# ─────────────────────────────────────────────────────────
-
-def test_unsubstantiated_claims():
-    """Unsubstantiated claims receive partial credit (~25.0) and are not treated as 0 or fraud."""
-    service = ScoringService()
-    evals = [
-        create_eval(
-            claim_id="c1",
-            claim_text="The company is committed to generational equality and SDG 5.",
-            claim_type=ClaimType.TARGET.value,
-            category="inclusion",
-            category_group=ClaimCategoryGroup.SOCIAL.value,
-            assessment=AssessmentCategory.UNSUBSTANTIATED,
-            reasoning="Filing contains no formal milestone targets or timetable.",
-        ),
-        create_eval(
-            claim_id="c2",
-            claim_text="We strive to be the global benchmark in ethical AI governance.",
-            claim_type=ClaimType.GENERAL.value,
-            category="ethics",
-            category_group=ClaimCategoryGroup.GOVERNANCE.value,
-            assessment=AssessmentCategory.UNSUBSTANTIATED,
-            reasoning="General aspirational policy without verification.",
-        ),
-    ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="Aspirational Corp",
-        ticker="ASPR",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=2,
-    )
-
-    assert result.score_status == ScoreStatus.SCORED
-    assert result.esg_integrity_score is not None
-    assert 20.0 <= result.esg_integrity_score <= 30.0
-    assert result.unsubstantiated_claims == 2
+def test_below_minimum_assessable_claims_returns_insufficient_data():
+    r = score([ev("s1"), ev("s2")])
+    assert r.score_status == ScoreStatus.INSUFFICIENT_DATA
+    assert r.esg_integrity_score is None
+    assert "at least 3" in r.main_concerns[0]
 
 
-# ─────────────────────────────────────────────────────────
-# 5. Insufficient Evidence (Excluded from Score, Lowers Coverage)
-# ─────────────────────────────────────────────────────────
+def test_missing_dimension_is_not_zero():
+    r = score([ev(f"e{i}") for i in range(3)] + [ev(f"s{i}", group="social", category="diversity") for i in range(3)])
+    gov = r.dimensions["governance"]
+    assert r.governance_score is None
+    assert gov.status == ScoreStatus.INSUFFICIENT_DATA
+    assert gov.effective_weight == 0
+    assert r.esg_integrity_score == 96  # unaffected by the missing pillar
+    assert any("Governance" in c and "not zero" in c for c in r.main_concerns)
 
-def test_insufficient_evidence_penalizes_coverage():
-    """Insufficient evidence is not treated as contradictory; it reduces evidence coverage."""
-    service = ScoringService()
-    evals = [
-        create_eval(
-            claim_id="c1",
-            claim_text="Achieved 50% renewable energy in operations.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="renewable_energy",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref("ev_1", 0.50)],
-        ),
-        create_eval(
-            claim_id="c2",
-            claim_text="Eliminated all microplastics from supply packaging.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="waste",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.INSUFFICIENT_EVIDENCE,
-            reasoning="No relevant disclosures found in filing for microplastics.",
-        ),
-    ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="Partial Disclosure Corp",
-        ticker="PART",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=2,
-    )
-
-    assert result.score_status == ScoreStatus.SCORED
-    # The 1 supported claim keeps the integrity of assessed claims high
-    assert result.esg_integrity_score is not None
-    assert result.esg_integrity_score >= 90.0
-    # But evidence coverage is penalized to 50%
-    assert result.evidence_coverage == 50.0
-    assert result.insufficient_evidence_claims == 1
-
-
-# ─────────────────────────────────────────────────────────
-# 6. Zero Assessable Claims (Insufficient Data)
-# ─────────────────────────────────────────────────────────
-
-def test_no_assessable_claims_returns_insufficient_data():
-    """A company with no assessable sustainability claims returns an explicit insufficient-data result."""
-    service = ScoringService()
-    # Either empty list or all claims having insufficient evidence
-    evals = [
-        create_eval(
-            claim_id="c1",
-            claim_text="Company maintains zero deforestation.",
-            assessment=AssessmentCategory.INSUFFICIENT_EVIDENCE,
-        ),
-    ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="Silent Corp",
-        ticker="SILENT",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=1,
-    )
-
-    assert result.score_status == ScoreStatus.INSUFFICIENT_DATA
-    assert result.esg_integrity_score is None
-    assert result.confidence == ConfidenceLevel.INSUFFICIENT
-    assert result.environmental_score is None
-
-
-def test_empty_evaluations_returns_insufficient_data():
-    """Empty evaluation list cleanly returns insufficient data."""
-    service = ScoringService()
-    result = service.calculate_score_from_evaluations(
-        company_name="Empty Corp",
-        ticker="EMPTY",
-        market=MarketIdentifier.US_SEC,
-        evaluations=[],
-        total_claims_extracted=0,
-    )
-
-    assert result.score_status == ScoreStatus.INSUFFICIENT_DATA
-    assert result.esg_integrity_score is None
-    assert result.evidence_coverage == 0.0
-
-
-# ─────────────────────────────────────────────────────────
-# 7. Claims Across All Three ESG Dimensions
-# ─────────────────────────────────────────────────────────
 
 def test_claims_across_all_three_dimensions():
-    """Company with assessable claims in E, S, and G receives scores for all three pillars."""
-    service = ScoringService()
+    r = score(
+        [ev(f"e{i}") for i in range(3)]
+        + [ev(f"s{i}", A.PARTIALLY_SUPPORTED, group="social", category="diversity") for i in range(3)]
+        + [ev(f"g{i}", A.UNSUBSTANTIATED, group="governance", category="board") for i in range(3)]
+    )
+    assert (r.environmental_score, r.social_score, r.governance_score) == (96, 58, 22)
+    # (0.40*96 + 0.35*58 + 0.25*22) / 1.0 = 64.2 -> 64
+    assert r.esg_integrity_score == 64
+    assert sum(d.effective_weight for d in r.dimensions.values()) == pytest.approx(1.0, abs=0.002)
+
+
+def test_configured_pillar_weights_are_applied():
+    r = score([ev(f"e{i}") for i in range(3)] + [ev(f"s{i}", A.INCONSISTENT, group="social") for i in range(3)])
+    # (0.40*96 + 0.35*0) / 0.75 = 51.2 -> 51 (an unweighted claim average would give 48)
+    assert r.esg_integrity_score == 51
+
+
+def test_thinly_evidenced_pillar_is_down_weighted():
+    r = score([ev(f"e{i}") for i in range(3)] + [ev("g1", A.INCONSISTENT, group="governance")])
+    # Governance weight 0.25 * (1/3): (0.40*96) / (0.40 + 0.0833) = 79.4 -> 79
+    assert r.esg_integrity_score == 79
+    assert r.dimensions["governance"].confidence == ConfidenceLevel.LOW
+
+
+def test_unmapped_category_excluded_and_reported():
+    r = score([ev(f"e{i}") for i in range(3)] + [ev("o1", A.INCONSISTENT, group="other")])
+    assert r.unmapped_claims == 1
+    assert r.esg_integrity_score == 96
+
+
+# ─────────────────────────────────────────────────────────
+# Materiality and volume damping
+# ─────────────────────────────────────────────────────────
+
+def test_few_highly_material_claims_dominate_generic_statements():
+    material = [
+        ev(f"m{i}", A.INCONSISTENT, text="Reduced total corporate carbon emissions by half.", claim_type="achievement")
+        for i in range(2)
+    ]
+    boilerplate = [
+        ev(f"g{i}", A.SUPPORTED, text=f"We care about the environment, statement {i}.", claim_type="general",
+           category="sustainability")
+        for i in range(200)
+    ]
+    r = score(material + boilerplate)
+    # High weight 3.0; low weight 120 capped at 25% of total weight => cap = 3.0 * 0.25 / 0.75 = 1.0
+    # Score = (3.0*0 + 1.0*96) / 4.0 = 24
+    assert r.esg_integrity_score == 24
+    assert any("Volume damping" in f for f in r.dimensions["environmental"].key_factors)
+
+
+def test_publishing_more_statements_does_not_raise_score():
+    material = [ev(f"m{i}", A.UNSUBSTANTIATED, claim_type="target") for i in range(3)]
+    few = score(material + [ev(f"g{i}", claim_type="general") for i in range(3)])
+    many = score(material + [ev(f"g{i}", claim_type="general") for i in range(300)])
+    assert many.esg_integrity_score == few.esg_integrity_score
+
+
+def test_quantified_and_target_year_detection_ignores_report_headers():
+    assert QUANTITATIVE_PATTERN.search("We reduced emissions by 15.8% versus 2021.")
+    assert QUANTITATIVE_PATTERN.search("We will reach net zero by 2030.")
+    assert QUANTITATIVE_PATTERN.search("Trained 5,000 employees in safety.")
+    assert QUANTITATIVE_PATTERN.search("Invested GH₵ 12 million in schools.")
+    assert not QUANTITATIVE_PATTERN.search("Scancom PLC 2024 Annual Report: we are committed to communities.")
+
+
+def test_quantified_claim_gets_higher_weight():
+    r = score([ev("q", text="Cut emissions by 20%."), ev("n", text="Cut emissions substantially."), ev("x")])
+    w = {c.claim_id: c.materiality_weight for c in r.claim_scores}
+    assert w["q"] == pytest.approx(1.8)
+    assert w["n"] == pytest.approx(1.5)
+
+
+# ─────────────────────────────────────────────────────────
+# Sectors, Ghana and US
+# ─────────────────────────────────────────────────────────
+
+def test_mining_sector_boosts_water_and_rehabilitation_claims():
     evals = [
-        create_eval(
-            claim_id="e1",
-            claim_text="Reduced carbon emissions by 15.8% vs 2021 baseline.",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref()],
-        ),
-        create_eval(
-            claim_id="s1",
-            claim_text="Achieved 42.8% female representation in workforce.",
-            category_group=ClaimCategoryGroup.SOCIAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref()],
-        ),
-        create_eval(
-            claim_id="g1",
-            claim_text="Audit committee operates an independent whistleblowing hotline.",
-            category_group=ClaimCategoryGroup.GOVERNANCE.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref()],
-        ),
+        ev("w", category="water", text="Recycled water at the tailings facility."),
+        ev("r", category="environmental_management", text="Completed land rehabilitation of mined areas."),
+        ev("x", category="diversity", group="social", text="Hosted a staff diversity forum."),
     ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="Balanced ESG Corp",
-        ticker="BAL",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=3,
-    )
-
-    assert result.environmental_score is not None
-    assert result.social_score is not None
-    assert result.governance_score is not None
-    assert len(result.dimensions) == 3
-    assert all(d.status == ScoreStatus.SCORED for d in result.dimensions.values())
+    r = score(evals, sector="Mining", market=MarketIdentifier.GH_GSE)
+    m = {c.claim_id: c.sector_priority_match for c in r.claim_scores}
+    assert m == {"w": True, "r": True, "x": False}
+    assert r.materiality_summary["matched_sector_profile"] == "mining"
 
 
-# ─────────────────────────────────────────────────────────
-# 8. Missing Information From One Dimension
-# ─────────────────────────────────────────────────────────
-
-def test_missing_dimension_returns_insufficient_data_for_that_dimension():
-    """A dimension with no claims returns insufficient_data for that pillar without zeroing it."""
-    service = ScoringService()
-    evals = [
-        create_eval(
-            claim_id="e1",
-            claim_text="Reduced carbon emissions by 10%.",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref()],
-        ),
-        create_eval(
-            claim_id="s1",
-            claim_text="Achieved 50% diversity in leadership.",
-            category_group=ClaimCategoryGroup.SOCIAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref()],
-        ),
-        # Notice: NO Governance claims!
-    ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="No Governance Corp",
-        ticker="NOGOV",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=2,
-    )
-
-    assert result.environmental_score is not None
-    assert result.social_score is not None
-    assert result.governance_score is None  # Strictly None, NOT 0.0
-    gov_dim = result.dimensions[ClaimCategoryGroup.GOVERNANCE.value]
-    assert gov_dim.status == ScoreStatus.INSUFFICIENT_DATA
-    assert gov_dim.score is None
+def test_mining_criteria_not_applied_to_banks_or_telecoms():
+    evals = [ev("w", category="water", text="Recycled water at the tailings facility."), ev("a"), ev("b")]
+    for sector in ("Banking", "Telecommunications"):
+        r = score(evals, sector=sector, market=MarketIdentifier.GH_GSE)
+        assert next(c for c in r.claim_scores if c.claim_id == "w").sector_priority_match is False
 
 
-# ─────────────────────────────────────────────────────────
-# 9 & 10. Materiality Weighting & Volume Damping
-# ─────────────────────────────────────────────────────────
-
-def test_materiality_and_volume_damping():
-    """A small number of highly material claims cannot be drowned out by low-materiality boilerplate."""
-    service = ScoringService()
-
-    # 1 highly material quantified achievement contradicted
-    material_inconsistent = create_eval(
-        claim_id="mat_1",
-        claim_text="Reduced total corporate carbon emissions by 50% in 2024.",
-        claim_type=ClaimType.ACHIEVEMENT.value,
-        category="carbon",
-        category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-        assessment=AssessmentCategory.INCONSISTENT,
-        referenced_evidence=[sample_evidence_ref()],
-    )
-
-    # 4 generic policy statements marked supported
-    boilerplate_supported = [
-        create_eval(
-            claim_id=f"gen_{i}",
-            claim_text=f"The company maintains a general environmental statement {i}.",
-            claim_type=ClaimType.GENERAL.value,
-            category="sustainability",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref()],
-        )
-        for i in range(4)
-    ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="Greenwasher Corp",
-        ticker="GWSH",
-        market=MarketIdentifier.US_SEC,
-        evaluations=[material_inconsistent] + boilerplate_supported,
-        total_claims_extracted=5,
-    )
-
-    # The high materiality of the quantified achievement pulls down the score substantially
-    # It cannot simply be 80% (4/5) because the achievement has much higher weight!
-    assert result.esg_integrity_score < 60.0
-    assert result.inconsistent_claims == 1
-
-
-# ─────────────────────────────────────────────────────────
-# 11. Different Reporting Periods
-# ─────────────────────────────────────────────────────────
-
-def test_different_reporting_periods():
-    """Reporting period is accurately reflected in score responses."""
-    service = ScoringService()
-    evals = [create_eval(claim_id="c1", claim_text="Carbon reduced by 10%.", referenced_evidence=[sample_evidence_ref()])]
-
-    res_2023 = service.calculate_score_from_evaluations(
-        company_name="Period Corp",
-        ticker="PRD",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=1,
-        reporting_period="2023",
-    )
-    res_2024 = service.calculate_score_from_evaluations(
-        company_name="Period Corp",
-        ticker="PRD",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=1,
-        reporting_period="2024",
-    )
-
-    assert res_2023.reporting_period == "2023"
-    assert res_2024.reporting_period == "2024"
-
-
-# ─────────────────────────────────────────────────────────
-# 12, 13 & 14. Sector Priority & Ghana GSE Considerations
-# ─────────────────────────────────────────────────────────
-
-def test_ghana_sector_materiality_boost():
-    """GSE mining company gets a materiality boost for water and tailings claims."""
-    service = ScoringService()
-    evals = [
-        create_eval(
-            claim_id="m1",
-            claim_text="Installed closed-circuit water recycling at tailings storage facility.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="water",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref()],
-        ),
-    ]
-
-    result = service.calculate_score_from_evaluations(
-        company_name="AngloGold Ghana",
-        ticker="AGA",
+def test_telecom_ghana_keywords_boost():
+    r = score(
+        [ev("e", category="community", group="social", text="Our e-waste programme collected old handsets."),
+         ev("a"), ev("b")],
+        sector="Telecommunications",
         market=MarketIdentifier.GH_GSE,
-        evaluations=evals,
-        total_claims_extracted=1,
-        sector="Mining",
     )
-
-    # Claim score detail should record sector_priority_match=True
-    assert result.claim_scores[0].sector_priority_match is True
-    # Materiality weight: 1.5 (achievement) * 1.3 (sector boost) = 1.95
-    assert result.claim_scores[0].materiality_weight >= 1.95
+    assert next(c for c in r.claim_scores if c.claim_id == "e").sector_priority_match is True
 
 
-def test_us_sec_sector_materiality_boost():
-    """US SEC electronic computer company gets materiality boost for renewable energy."""
-    service = ScoringService()
-    evals = [
-        create_eval(
-            claim_id="a1",
-            claim_text="100% of electricity for data centres sourced from renewable energy.",
-            claim_type=ClaimType.ACHIEVEMENT.value,
-            category="renewable_energy",
-            category_group=ClaimCategoryGroup.ENVIRONMENTAL.value,
-            assessment=AssessmentCategory.SUPPORTED,
-            referenced_evidence=[sample_evidence_ref()],
-        ),
-    ]
+def test_us_sic_sector_profile_matches():
+    r = score([ev("r", category="renewable_energy"), ev("a"), ev("b")], sector="Electronic Computers")
+    assert r.materiality_summary["matched_sector_profile"] == "technology"
+    assert r.claim_scores[0].sector_priority_match is True
 
-    result = service.calculate_score_from_evaluations(
-        company_name="Apple Inc.",
-        ticker="AAPL",
-        market=MarketIdentifier.US_SEC,
-        evaluations=evals,
-        total_claims_extracted=1,
-        sector="Electronic Computers",
-    )
 
-    assert result.claim_scores[0].sector_priority_match is True
+def test_unknown_sector_applies_no_boost():
+    r = score([ev("w", category="water"), ev("a"), ev("b")], sector="Real Estate Investment Trusts")
+    assert r.materiality_summary["matched_sector_profile"] is None
+    assert not any(c.sector_priority_match for c in r.claim_scores)
+
+
+def test_same_inputs_score_identically_in_both_markets():
+    evals = [ev(f"e{i}") for i in range(3)] + [ev("u", A.UNSUBSTANTIATED, group="social")]
+    us = score(evals, sector="Mining", market=MarketIdentifier.US_SEC)
+    gh = score(evals, sector="Mining", market=MarketIdentifier.GH_GSE)
+    assert us.esg_integrity_score == gh.esg_integrity_score
+    assert [c.materiality_weight for c in us.claim_scores] == [c.materiality_weight for c in gh.claim_scores]
+    assert (us.market, gh.market) == (MarketIdentifier.US_SEC, MarketIdentifier.GH_GSE)
+
+
+def test_reporting_period_preserved():
+    evals = [ev(f"s{i}") for i in range(3)]
+    assert score(evals, period="2023").reporting_period == "2023"
+    assert score(evals, period="FY2024").reporting_period == "FY2024"
 
 
 # ─────────────────────────────────────────────────────────
-# 16. Deterministic Repeatability
+# Confidence and coverage
+# ─────────────────────────────────────────────────────────
+
+def test_confidence_low_with_few_claims():
+    assert score([ev(f"s{i}") for i in range(3)]).confidence == ConfidenceLevel.LOW
+
+
+def test_confidence_medium_with_moderate_sample():
+    assert score([ev(f"s{i}") for i in range(5)]).confidence == ConfidenceLevel.MEDIUM
+
+
+def test_confidence_capped_for_rule_based_evaluations():
+    evals = [ev(f"e{i}") for i in range(6)] + [ev(f"s{i}", group="social") for i in range(6)]
+    r = score(evals)
+    assert r.confidence == ConfidenceLevel.MEDIUM
+    assert r.rule_based_evaluations == 12
+    assert any("rule-based" in c for c in r.main_concerns)
+
+
+def test_confidence_high_requires_llm_sample_coverage_and_breadth():
+    evals = [ev(f"e{i}", mode=EvaluationMode.LLM) for i in range(6)] + [
+        ev(f"s{i}", group="social", mode=EvaluationMode.LLM) for i in range(6)
+    ]
+    assert score(evals).confidence == ConfidenceLevel.HIGH
+    # Same claims in a single pillar: not enough breadth for HIGH
+    single = [ev(f"e{i}", mode=EvaluationMode.LLM) for i in range(12)]
+    assert score(single).confidence == ConfidenceLevel.MEDIUM
+
+
+def test_low_coverage_lowers_confidence():
+    evals = [ev(f"s{i}", mode=EvaluationMode.LLM) for i in range(10)] + [
+        ev(f"x{i}", A.INSUFFICIENT_EVIDENCE, mode=EvaluationMode.LLM) for i in range(15)
+    ]
+    r = score(evals)
+    assert r.evidence_coverage == 40
+    assert r.confidence == ConfidenceLevel.LOW
+
+
+def test_coverage_is_not_described_as_corroboration():
+    r = score([ev(f"u{i}", A.UNSUBSTANTIATED) for i in range(5)])
+    assert r.evidence_coverage == 100
+    assert r.substantiation_rate == 0
+    assert not any("corroborat" in p.lower() for p in r.main_positive_factors)
+    assert any("Only 0%" in c for c in r.main_concerns)
+
+
+# ─────────────────────────────────────────────────────────
+# Integrity, determinism, boundaries, invalid data
 # ─────────────────────────────────────────────────────────
 
 def test_deterministic_repeatability():
-    """Identical evaluation inputs produce identical numerical scores and weights."""
-    service = ScoringService()
-    evals = [
-        create_eval(claim_id="c1", claim_text="15.8% carbon reduction.", referenced_evidence=[sample_evidence_ref()]),
-        create_eval(claim_id="c2", claim_text="50% board female representation.", assessment=AssessmentCategory.PARTIALLY_SUPPORTED),
-        create_eval(claim_id="c3", claim_text="Zero workplace accidents.", assessment=AssessmentCategory.INCONSISTENT),
-    ]
-
-    run1 = service.calculate_score_from_evaluations("Repeat Corp", "RPT", MarketIdentifier.US_SEC, evals, 3)
-    run2 = service.calculate_score_from_evaluations("Repeat Corp", "RPT", MarketIdentifier.US_SEC, evals, 3)
-
-    assert run1.esg_integrity_score == run2.esg_integrity_score
-    assert run1.evidence_coverage == run2.evidence_coverage
-    assert run1.confidence == run2.confidence
-    assert [c.claim_score for c in run1.claim_scores] == [c.claim_score for c in run2.claim_scores]
+    evals = [ev("s"), ev("p", A.PARTIALLY_SUPPORTED), ev("i", A.INCONSISTENT, group="social"),
+             ev("u", A.UNSUBSTANTIATED, group="governance")]
+    a = score(evals, sector="Mining").model_dump(exclude={"assessment_timestamp"})
+    b = score(evals, sector="Mining").model_dump(exclude={"assessment_timestamp"})
+    assert a == b
 
 
-# ─────────────────────────────────────────────────────────
-# 17. Boundary Conditions & Clamping
-# ─────────────────────────────────────────────────────────
+def test_score_boundaries_and_whole_number_rounding():
+    top = score([ev(f"s{i}", confidence=C.HIGH, refs=[ref("e", 1.0)]) for i in range(3)])
+    bottom = score([ev(f"i{i}", A.INCONSISTENT) for i in range(3)])
+    assert 0 <= bottom.esg_integrity_score <= top.esg_integrity_score <= 100
+    assert bottom.esg_integrity_score == 0
+    for r in (top, bottom):
+        assert r.esg_integrity_score == int(r.esg_integrity_score)
 
-def test_score_boundary_conditions():
-    """Scores are strictly bounded within [0.0, 100.0] and rounded to 1 decimal place."""
-    service = ScoringService()
-
-    # Extreme high
-    eval_high = [create_eval(claim_id="h1", claim_text="Super supported claim.", confidence=EvaluationConfidence.HIGH, referenced_evidence=[sample_evidence_ref("ev", 0.95)])]
-    res_high = service.calculate_score_from_evaluations("High Corp", "HI", MarketIdentifier.US_SEC, eval_high, 1)
-    assert res_high.esg_integrity_score <= 100.0
-
-    # Extreme low
-    eval_low = [create_eval(claim_id="l1", claim_text="Contradicted claim.", assessment=AssessmentCategory.INCONSISTENT)]
-    res_low = service.calculate_score_from_evaluations("Low Corp", "LO", MarketIdentifier.US_SEC, eval_low, 1)
-    assert res_low.esg_integrity_score == 0.0
-
-
-# ─────────────────────────────────────────────────────────
-# 18. Evidence Traceability
-# ─────────────────────────────────────────────────────────
 
 def test_evidence_traceability():
-    """Scoring breakdown retains claim_id, evaluation_id, evidence_ids, and source citations."""
-    service = ScoringService()
-    ref = sample_evidence_ref("ev_specific_123", 0.48)
-    evals = [create_eval(claim_id="claim_trace_999", claim_text="Specific claim text.", referenced_evidence=[ref])]
+    r = score([ev("claim_abc", refs=[ref("ev_123"), ref("ev_456")]), ev("b"), ev("c")])
+    d = next(c for c in r.claim_scores if c.claim_id == "claim_abc")
+    assert d.evaluation_id == "eval_claim_abc"
+    assert d.referenced_evidence_ids == ["ev_123", "ev_456"]
+    assert "0000000000-26-000001" in r.source_document_references[0]
+    assert any("[claim_abc]" in p for p in r.main_positive_factors)
 
-    result = service.calculate_score_from_evaluations(
-        company_name="Trace Corp",
-        ticker="TRC",
-        market=MarketIdentifier.US_SEC,
+
+def test_duplicate_claim_evaluations_counted_once():
+    r = score([ev("dup"), ev("dup"), ev("b"), ev("c")])
+    assert r.total_claims_assessed == 3
+    assert r.duplicate_evaluations_ignored == 1
+
+
+def test_unknown_claim_type_treated_as_general():
+    r = score([ev("x", claim_type="aspiration"), ev("a"), ev("b")])
+    assert next(c for c in r.claim_scores if c.claim_id == "x").materiality_weight == pytest.approx(0.6)
+
+
+def test_incomplete_evaluation_data_rejected_by_model():
+    with pytest.raises(ValidationError):
+        ClaimEvaluation(claim_id="c", company_ticker="T", company_name="T", claim_text="x")
+    with pytest.raises(ValidationError):
+        ev("c").model_copy(update={}).__class__(**{**ev("c").model_dump(), "assessment": "greenwashing"})
+
+
+def test_disclaimer_present():
+    r = score([ev(f"s{i}") for i in range(3)])
+    assert "does not" in r.disclaimer.lower() and "greenwashing" in r.disclaimer.lower()
+
+
+# ─────────────────────────────────────────────────────────
+# Service integration (SEC + GSE) with mocked upstream services
+# ─────────────────────────────────────────────────────────
+
+def sec_eval_response(evals, fiscal_year=2026, report_date="2026-09-26", accession="0000320193-26-000026"):
+    return CompanyEvaluationResponse(
+        company=Company(ticker="AAPL", company_name="Apple Inc.", cik="0000320193",
+                        sic="3571", sic_description="Electronic Computers"),
+        filing_accession_number=accession,
+        form_type="10-K",
+        filing_date="2026-11-03",
+        report_date=report_date,
+        fiscal_year=fiscal_year,
+        summary=EvaluationSummary(total_claims_evaluated=len(evals), total_claims_extracted=len(evals) + 2),
         evaluations=evals,
-        total_claims_extracted=1,
-        source_document_references=["SEC EDGAR Form 10-K (0000320193-26-000026)"],
-    )
-
-    detail = result.claim_scores[0]
-    assert detail.claim_id == "claim_trace_999"
-    assert detail.evaluation_id == "eval_claim_trace_999"
-    assert "ev_specific_123" in detail.referenced_evidence_ids
-    assert "0000320193-26-000026" in result.source_document_references[0]
-
-
-# ─────────────────────────────────────────────────────────
-# 19. Confidence Logic & Small Sample Guard
-# ─────────────────────────────────────────────────────────
-
-def test_confidence_small_sample_guard():
-    """A company with fewer than 3 claims can never achieve HIGH confidence."""
-    service = ScoringService()
-    # 2 perfect claims
-    evals = [
-        create_eval(claim_id="c1", claim_text="100% renewable energy.", referenced_evidence=[sample_evidence_ref()]),
-        create_eval(claim_id="c2", claim_text="Zero workplace injuries.", referenced_evidence=[sample_evidence_ref()]),
-    ]
-
-    result = service.calculate_score_from_evaluations("Small Corp", "SML", MarketIdentifier.US_SEC, evals, 2)
-    # Strictly LOW because < 3 claims
-    assert result.confidence == ConfidenceLevel.LOW
-
-
-def test_confidence_high_with_sufficient_sample():
-    """A company with >= 6 claims, high coverage, and multiple dimensions achieves HIGH confidence."""
-    service = ScoringService()
-    evals = [
-        create_eval(claim_id=f"e_{i}", claim_text=f"Environmental claim {i}.", category_group=ClaimCategoryGroup.ENVIRONMENTAL.value, referenced_evidence=[sample_evidence_ref()])
-        for i in range(4)
-    ] + [
-        create_eval(claim_id=f"s_{i}", claim_text=f"Social claim {i}.", category_group=ClaimCategoryGroup.SOCIAL.value, referenced_evidence=[sample_evidence_ref()])
-        for i in range(3)
-    ]
-
-    result = service.calculate_score_from_evaluations("Large Corp", "LRG", MarketIdentifier.US_SEC, evals, 7)
-    assert result.confidence == ConfidenceLevel.HIGH
-
-
-# ─────────────────────────────────────────────────────────
-# 21. API Endpoint Tests
-# ─────────────────────────────────────────────────────────
-
-def test_get_company_score_endpoint():
-    """GET /api/v1/companies/{ticker}/score returns 200 with ESGIntegrityScoreResponse."""
-    mock_company = Company(ticker="AAPL", company_name="Apple Inc.", cik="0000320193")
-    mock_evals = [create_eval(claim_id="c1", claim_text="Apple renewable energy target.", referenced_evidence=[sample_evidence_ref()])]
-    mock_eval_response = CompanyEvaluationResponse(
-        company=mock_company,
-        filing_accession_number="0000320193-26-000026",
-        form_type="10-K",
-        filing_date="2026-11-03",
-        summary=EvaluationSummary(total_claims_evaluated=1, total_claims_extracted=1, supported_count=1),
-        evaluations=mock_evals,
         provider_mode="rule_based",
     )
 
-    with patch("app.services.llm_service.LLMService.evaluate_company_filing", return_value=mock_eval_response):
-        response = client.get("/api/v1/companies/AAPL/score")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["ticker"] == "AAPL"
-        assert data["company_name"] == "Apple Inc."
-        assert data["score_status"] == "scored"
-        assert data["esg_integrity_score"] is not None
-        assert "disclaimer" in data
 
-
-def test_get_company_score_breakdown_endpoint():
-    """GET /api/v1/companies/{ticker}/score/breakdown returns full transparent calculation trace."""
-    mock_company = Company(ticker="AAPL", company_name="Apple Inc.", cik="0000320193")
-    mock_evals = [create_eval(claim_id="c1", claim_text="Apple carbon reduction target.", referenced_evidence=[sample_evidence_ref()])]
-    mock_eval_response = CompanyEvaluationResponse(
-        company=mock_company,
-        filing_accession_number="0000320193-26-000026",
-        form_type="10-K",
-        filing_date="2026-11-03",
-        summary=EvaluationSummary(total_claims_evaluated=1, total_claims_extracted=1, supported_count=1),
-        evaluations=mock_evals,
+def gse_analysis_response(evals, period="2024", doc_id="doc_gse_mtngh_2024"):
+    return GSEAnalysisResponse(
+        company=GSECompany(ticker="MTNGH", company_name="Scancom Plc", market=MarketIdentifier.GH_GSE,
+                           sector="Telecommunications", industry="Mobile Telecommunications"),
+        document=MarketDocument(
+            document_id=doc_id, company_ticker="MTNGH", company_name="Scancom Plc",
+            market=MarketIdentifier.GH_GSE, source_type=DocumentSourceType.ANNUAL_REPORT,
+            title=f"Scancom PLC (MTN Ghana) {period} Annual Report", reporting_period=period,
+            source_url="https://mtn.com.gh/report.pdf", retrieval_status="retrieved", format="pdf",
+        ),
+        total_claims_extracted=len(evals) + 2,
+        evaluations=evals,
+        summary=EvaluationSummary(total_claims_evaluated=len(evals), total_claims_extracted=len(evals) + 2),
         provider_mode="rule_based",
     )
 
-    with patch("app.services.llm_service.LLMService.evaluate_company_filing", return_value=mock_eval_response):
-        response = client.get("/api/v1/companies/AAPL/score/breakdown")
-        assert response.status_code == 200
-        data = response.json()
-        assert "dimensions" in data
-        assert "claim_scores" in data
-        assert len(data["claim_scores"]) == 1
-        assert data["claim_scores"][0]["claim_id"] == "c1"
+
+def make_service(sec_resp=None, gse_resp=None):
+    llm = MagicMock()
+    llm.evaluate_company_filing.return_value = sec_resp
+    gse = MagicMock()
+    gse.analyze_company_document.return_value = gse_resp
+    return ScoringService(llm_service=llm, gse_service=gse), llm, gse
 
 
-def test_get_company_score_history_endpoint():
-    """GET /api/v1/companies/{ticker}/score/history returns recorded scoring history."""
-    response = client.get("/api/v1/companies/AAPL/score/history")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["ticker"] == "AAPL"
-    assert "history" in data
-    assert "note" in data
+def test_sec_company_uses_fiscal_period_and_filing_reference():
+    svc, _, _ = make_service(sec_resp=sec_eval_response([ev(f"s{i}") for i in range(3)]))
+    r = svc.calculate_company_score("aapl")
+    assert r.market == MarketIdentifier.US_SEC
+    assert r.reporting_period == "FY2026"
+    assert r.total_claims_extracted == 5
+    assert "0000320193-26-000026" in r.source_document_references[0]
+    assert r.materiality_summary["matched_sector_profile"] == "technology"
 
 
-def test_get_gse_company_score_endpoint():
-    """GET /api/v1/gse/companies/{ticker}/score returns 200 with GSE company score."""
-    mock_company = GSECompany(ticker="MTNGH", company_name="Scancom Plc", market=MarketIdentifier.GH_GSE, sector="Telecommunications")
-    mock_doc = MarketDocument(
-        document_id="doc_gse_mtngh_2024",
-        company_ticker="MTNGH",
-        company_name="Scancom Plc",
-        market=MarketIdentifier.GH_GSE,
-        source_type=DocumentSourceType.ANNUAL_REPORT,
-        title="Scancom PLC 2024 Annual Report",
-        reporting_period="2024",
-        retrieval_status="retrieved",
-        format="pdf",
+def test_sec_reporting_period_not_invented_when_unknown():
+    svc, _, _ = make_service(sec_resp=sec_eval_response([ev(f"s{i}") for i in range(3)],
+                                                        fiscal_year=None, report_date=None))
+    assert svc.calculate_company_score("AAPL").reporting_period is None
+
+
+def test_gse_company_scoring_and_sources():
+    svc, _, gse = make_service(gse_resp=gse_analysis_response([ev(f"s{i}") for i in range(3)]))
+    r = svc.calculate_gse_score("mtngh")
+    assert r.market == MarketIdentifier.GH_GSE
+    assert r.reporting_period == "2024"
+    assert "doc_gse_mtngh_2024" in r.source_document_references[0]
+    assert "https://mtn.com.gh/report.pdf" in r.source_document_references
+    assert gse.analyze_company_document.call_args.kwargs["ticker"] == "MTNGH"
+
+
+def test_history_only_contains_real_assessments_one_per_document():
+    svc, _, gse = make_service(gse_resp=gse_analysis_response([ev(f"s{i}") for i in range(3)]))
+    assert svc.get_company_score_history("MTNGH", MarketIdentifier.GH_GSE).total_records == 0
+
+    svc.calculate_gse_score("MTNGH")
+    svc.calculate_gse_score("MTNGH")  # same document re-scored: replaces, not duplicates
+    assert svc.get_company_score_history("MTNGH", MarketIdentifier.GH_GSE).total_records == 1
+
+    gse.analyze_company_document.return_value = gse_analysis_response(
+        [ev(f"u{i}", A.UNSUBSTANTIATED) for i in range(3)], period="2023", doc_id="doc_gse_mtngh_2023")
+    svc.calculate_gse_score("MTNGH", reporting_period="2023")
+    hist = svc.get_company_score_history("MTNGH", MarketIdentifier.GH_GSE)
+    assert hist.total_records == 2
+    assert [h.reporting_period for h in hist.history] == ["2023", "2024"]
+    assert [h.esg_integrity_score for h in hist.history] == [22, 96]
+
+
+def test_market_caches_are_isolated():
+    svc, _, _ = make_service(
+        sec_resp=sec_eval_response([ev(f"s{i}") for i in range(3)]),
+        gse_resp=gse_analysis_response([ev(f"i{i}", A.INCONSISTENT) for i in range(3)]),
     )
-    mock_evals = [create_eval(claim_id="gse_1", claim_text="15.8% carbon reduction at switch centres.", referenced_evidence=[sample_evidence_ref()])]
-    mock_gse_analysis = GSEAnalysisResponse(
-        company=mock_company,
-        document=mock_doc,
-        total_claims_extracted=1,
-        evaluations=mock_evals,
-        summary=EvaluationSummary(total_claims_evaluated=1, total_claims_extracted=1, supported_count=1),
-        provider_mode="rule_based",
+    svc.calculate_company_score("AAPL")
+    svc.calculate_gse_score("MTNGH")
+    assert svc.get_company_score("AAPL", MarketIdentifier.US_SEC).esg_integrity_score == 96
+    assert svc.get_company_score("MTNGH", MarketIdentifier.GH_GSE).esg_integrity_score == 0
+    assert svc.get_company_score_history("AAPL", MarketIdentifier.GH_GSE).total_records == 0
+
+
+# ─────────────────────────────────────────────────────────
+# API endpoints (isolated service via dependency override)
+# ─────────────────────────────────────────────────────────
+
+@pytest.fixture
+def api_service():
+    svc, llm, gse = make_service(
+        sec_resp=sec_eval_response([ev(f"s{i}") for i in range(3)] + [ev("u", A.UNSUBSTANTIATED, group="social")]),
+        gse_resp=gse_analysis_response([ev(f"s{i}") for i in range(3)]),
     )
-
-    with patch("app.services.gse_service.GSEService.analyze_company_document", return_value=mock_gse_analysis):
-        response = client.get("/api/v1/gse/companies/MTNGH/score")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["ticker"] == "MTNGH"
-        assert data["market"] == "gh_gse"
-        assert data["score_status"] == "scored"
-        assert data["esg_integrity_score"] is not None
+    app.dependency_overrides[get_scoring_service] = lambda: svc
+    yield svc, llm, gse
+    app.dependency_overrides.pop(get_scoring_service, None)
 
 
-def test_get_gse_company_score_breakdown_endpoint():
-    """GET /api/v1/gse/companies/{ticker}/score/breakdown returns breakdown with Ghana sector info."""
-    mock_company = GSECompany(ticker="MTNGH", company_name="Scancom Plc", market=MarketIdentifier.GH_GSE, sector="Telecommunications")
-    mock_doc = MarketDocument(
-        document_id="doc_gse_mtngh_2024",
-        company_ticker="MTNGH",
-        company_name="Scancom Plc",
-        market=MarketIdentifier.GH_GSE,
-        source_type=DocumentSourceType.ANNUAL_REPORT,
-        title="Scancom PLC 2024 Annual Report",
-        reporting_period="2024",
-        retrieval_status="retrieved",
-        format="pdf",
-    )
-    mock_evals = [create_eval(claim_id="gse_1", claim_text="15.8% carbon reduction at switch centres.", referenced_evidence=[sample_evidence_ref()])]
-    mock_gse_analysis = GSEAnalysisResponse(
-        company=mock_company,
-        document=mock_doc,
-        total_claims_extracted=1,
-        evaluations=mock_evals,
-        summary=EvaluationSummary(total_claims_evaluated=1, total_claims_extracted=1, supported_count=1),
-        provider_mode="rule_based",
-    )
+def test_api_company_score(api_service):
+    resp = client.get("/api/v1/companies/AAPL/score")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ticker"] == "AAPL" and data["market"] == "us_sec"
+    assert data["score_status"] == "scored"
+    # E pillar = 96 (weight 0.40); S pillar = 22 (1 claim -> weight 0.35 * 1/3 = 0.1167) => 79.3 -> 79
+    assert data["esg_integrity_score"] == 79
+    assert data["reporting_period"] == "FY2026"
+    assert "claim_scores" not in data
+    assert data["disclaimer"]
 
-    with patch("app.services.gse_service.GSEService.analyze_company_document", return_value=mock_gse_analysis):
-        response = client.get("/api/v1/gse/companies/MTNGH/score/breakdown")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["ticker"] == "MTNGH"
-        assert "dimensions" in data
-        assert "claim_scores" in data
-        assert data["materiality_summary"]["sector"] == "Telecommunications"
+
+def test_api_company_score_breakdown(api_service):
+    data = client.get("/api/v1/companies/AAPL/score/breakdown").json()
+    assert set(data["dimensions"]) == {"environmental", "social", "governance"}
+    assert {c["claim_id"] for c in data["claim_scores"]} == {"s0", "s1", "s2", "u"}
+    assert data["methodology_details"]["min_assessable_claims"] == 3
+
+
+def test_api_company_score_history(api_service):
+    empty = client.get("/api/v1/companies/AAPL/score/history").json()
+    assert empty["total_records"] == 0 and empty["history"] == []
+    client.get("/api/v1/companies/AAPL/score")
+    hist = client.get("/api/v1/companies/AAPL/score/history").json()
+    assert hist["total_records"] == 1
+    assert "fabricated" in hist["note"]
+
+
+def test_api_company_score_invalid_ticker(api_service):
+    assert client.get("/api/v1/companies/@@@/score").status_code == 400
+    assert client.get("/api/v1/companies/@@@/score/history").status_code == 400
+
+
+def test_api_insufficient_data_returns_null_score(api_service):
+    svc, llm, _ = api_service
+    llm.evaluate_company_filing.return_value = sec_eval_response([ev("x", A.INSUFFICIENT_EVIDENCE)])
+    data = client.get("/api/v1/companies/AAPL/score").json()
+    assert data["score_status"] == "insufficient_data"
+    assert data["esg_integrity_score"] is None
+    assert data["confidence"] == "insufficient"
+
+
+def test_api_gse_score_and_breakdown(api_service):
+    data = client.get("/api/v1/gse/companies/MTNGH/score").json()
+    assert data["market"] == "gh_gse" and data["esg_integrity_score"] == 96
+    breakdown = client.get("/api/v1/gse/companies/MTNGH/score/breakdown").json()
+    assert breakdown["materiality_summary"]["matched_sector_profile"] == "telecommunications"
+    assert breakdown["materiality_summary"]["sector"] == "Telecommunications"
+
+
+def test_api_gse_score_with_explicit_document(api_service):
+    _, _, gse = api_service
+    resp = client.get("/api/v1/gse/companies/MTNGH/score",
+                      params={"source_url": "https://mtn.com.gh/r.pdf", "reporting_period": "2024"})
+    assert resp.status_code == 200
+    assert gse.analyze_company_document.call_args.kwargs["source_url"] == "https://mtn.com.gh/r.pdf"
+
+
+def test_api_gse_score_history(api_service):
+    client.get("/api/v1/gse/companies/MTNGH/score")
+    data = client.get("/api/v1/gse/companies/MTNGH/score/history").json()
+    assert data["market"] == "gh_gse" and data["total_records"] == 1
